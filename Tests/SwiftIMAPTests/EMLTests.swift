@@ -64,7 +64,7 @@ struct EMLParserTests {
         let data = Data(eml.utf8)
         let message = try Message(emlData: data)
 
-        #expect(message.parts.count == 2)
+        try #require(message.parts.count == 2, "Expected 2 parts, got \(message.parts.count)")
         #expect(message.parts[0].contentType == "text/plain; charset=UTF-8")
         #expect(message.parts[1].contentType == "text/html; charset=UTF-8")
         #expect(message.textBody?.contains("Plain text version.") == true)
@@ -97,7 +97,7 @@ struct EMLParserTests {
         let data = Data(eml.utf8)
         let message = try Message(emlData: data)
 
-        #expect(message.parts.count == 2)
+        try #require(message.parts.count == 2, "Expected 2 parts, got \(message.parts.count): \(message.parts.map { "\($0.section): \($0.contentType)" })")
         #expect(message.parts[1].filename == "report.pdf")
         #expect(message.parts[1].disposition == "attachment")
         #expect(message.parts[1].encoding == "base64")

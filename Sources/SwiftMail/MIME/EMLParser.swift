@@ -241,7 +241,8 @@ public struct EMLParser {
         var currentPart: [String]? = nil
 
         for line in lines {
-            let trimmed = line.trimmingCharacters(in: .init(charactersIn: "\r"))
+            // Trim CR (\r) and any trailing whitespace for boundary comparison
+            let trimmed = line.replacingOccurrences(of: "\r", with: "").trimmingCharacters(in: .whitespaces)
             if trimmed == endDelimiter || trimmed.hasPrefix(endDelimiter) {
                 if let part = currentPart {
                     rawParts.append(part.joined(separator: "\n"))
