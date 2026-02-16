@@ -118,6 +118,12 @@ struct Fetch: ParsableCommand {
 
     @Option(name: .shortAndLong, help: "Mailbox")
     var mailbox: String = "INBOX"
+    
+    @ArgumentParser.Flag(help: "Download raw RFC 822 message as .eml file")
+    var eml: Bool = false
+    
+    @Option(help: "Output directory (saves .eml with --eml, or .txt/.html without)")
+    var out: String?
 
     func run() throws {
         runAsyncBlock {
@@ -129,26 +135,77 @@ struct Fetch: ParsableCommand {
                 guard let uids = MessageIdentifierSet<UID>(string: uid) else {
                     throw ValidationError("Invalid UID list: \(uid)")
                 }
+                
+                var outputURL: URL?
+                if let out {
+                    outputURL = URL(fileURLWithPath: out, isDirectory: true)
+                    try FileManager.default.createDirectory(at: outputURL!, withIntermediateDirectories: true, attributes: nil)
+                }
+                
                 var found = false
                 
                 for try await message in server.fetchMessages(using: uids) {
                     found = true
-                    print("--- Message \(uid) ---")
-                    print("From: \(message.from ?? "")")
-                    print("Subject: \(message.subject ?? "")")
-                    print("Date: \(message.date?.description ?? "")")
-                    print("\nBody:")
-                    if let text = message.textBody {
-                        print(text)
-                    } else if let html = message.htmlBody {
-                        print("(HTML Body)\n")
-                        print(html)
+                    guard let msgUID = message.uid else { continue }
+                    
+                    // Sanitized subject for filenames
+                    let safeSubject = message.subject.map {
+                        String($0
+                            .replacingOccurrences(of: "/", with: "-")
+                            .replacingOccurrences(of: ":", with: "-")
+                            .replacingOccurrences(of: "\\", with: "-")
+                            .prefix(80))
                     }
                     
-                    if !message.attachments.isEmpty {
-                        print("\nAttachments: \(message.attachments.count)")
-                        for part in message.attachments {
-                            print("- \(part.filename ?? "unnamed") (\(part.contentType))")
+                    if eml {
+                        let data = try await server.fetchRawMessage(identifier: msgUID)
+                        let filename = safeSubject.map { "\(msgUID.value)-\($0).eml" } ?? "message-\(msgUID.value).eml"
+                        let destination = (outputURL ?? URL(fileURLWithPath: ".")).appendingPathComponent(filename)
+                        try data.write(to: destination)
+                        print("Saved \(destination.path) (\(data.count) bytes)")
+                    } else if let outputURL {
+                        // Write parsed content to file
+                        var content = ""
+                        content += "From: \(message.from ?? "")\n"
+                        content += "To: \(message.to.joined(separator: ", "))\n"
+                        content += "Subject: \(message.subject ?? "")\n"
+                        content += "Date: \(message.date?.description ?? "")\n\n"
+                        
+                        let ext: String
+                        if let text = message.textBody {
+                            content += text
+                            ext = "txt"
+                        } else if let html = message.htmlBody {
+                            content += html
+                            ext = "html"
+                        } else {
+                            content += "(No body)"
+                            ext = "txt"
+                        }
+                        
+                        let filename = safeSubject.map { "\(msgUID.value)-\($0).\(ext)" } ?? "message-\(msgUID.value).\(ext)"
+                        let destination = outputURL.appendingPathComponent(filename)
+                        try content.write(to: destination, atomically: true, encoding: .utf8)
+                        print("Saved \(destination.path)")
+                    } else {
+                        // Print to stdout
+                        print("--- Message \(uid) ---")
+                        print("From: \(message.from ?? "")")
+                        print("Subject: \(message.subject ?? "")")
+                        print("Date: \(message.date?.description ?? "")")
+                        print("\nBody:")
+                        if let text = message.textBody {
+                            print(text)
+                        } else if let html = message.htmlBody {
+                            print("(HTML Body)\n")
+                            print(html)
+                        }
+                        
+                        if !message.attachments.isEmpty {
+                            print("\nAttachments: \(message.attachments.count)")
+                            for part in message.attachments {
+                                print("- \(part.filename ?? "unnamed") (\(part.contentType))")
+                            }
                         }
                     }
                 }
