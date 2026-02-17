@@ -416,21 +416,16 @@ public actor IMAPServer {
             let continuation = continuationRef!
 
             // Start the cycling task
+            let cycleLogger = Logger(label: "com.cocoanetics.SwiftMail.IdleCycle")
             let cycleTask = Task.detached {
-                func log(_ msg: String) {
-                    if let data = ("[IdleCycle] \(msg)\n").data(using: .utf8) {
-                        try? FileHandle.standardError.write(contentsOf: data)
-                    }
-                }
                 do {
                     var cycleCount = 0
-                    log("cycling task started, interval=\(cycleInterval)s")
+                    cycleLogger.debug("Cycling task started, interval=\(cycleInterval)s")
                     while !Task.isCancelled {
                         cycleCount += 1
-                        log("cycle \(cycleCount): starting IDLE")
                         // Start IDLE
                         let idleStream = try await connection.idle()
-                        log("cycle \(cycleCount): IDLE started, waiting for events")
+                        cycleLogger.debug("Cycle \(cycleCount): IDLE started")
 
                         // Forward events until timeout or stream ends.
                         // Returns true if server sent BYE (stop cycling).
@@ -439,12 +434,11 @@ public actor IMAPServer {
                             group.addTask {
                                 do {
                                     try await Task.sleep(nanoseconds: UInt64(cycleInterval * 1_000_000_000))
-                                    log("cycle \(cycleCount): timer expired, sending DONE")
                                     // Timeout reached — send DONE to end IDLE.
                                     // This causes the server to send tagged OK,
                                     // which finishes the idleStream.
                                     try? await connection.done()
-                                    log("cycle \(cycleCount): DONE sent")
+                                    cycleLogger.debug("Cycle \(cycleCount): DONE sent")
                                 } catch {
                                     // Task cancelled
                                 }
@@ -454,13 +448,11 @@ public actor IMAPServer {
                             // Event consumer: forward events to wrapper stream
                             group.addTask {
                                 for await event in idleStream {
-                                        log("cycle \(cycleCount): got event: \(String(describing: event))")
                                     continuation.yield(event)
                                     if case .bye = event {
                                         return true  // Server-initiated close
                                     }
                                 }
-                                log("cycle \(cycleCount): event stream ended")
                                 return false  // Stream ended normally (DONE was sent)
                             }
 
@@ -480,9 +472,8 @@ public actor IMAPServer {
                         if Task.isCancelled || gotBye { break }
 
                         // NOOP to collect any buffered untagged responses
-                        log("cycle \(cycleCount): sending NOOP")
                         let noopEvents = try await connection.noop()
-                        log("cycle \(cycleCount): NOOP returned \(noopEvents.count) events")
+                        cycleLogger.debug("Cycle \(cycleCount): NOOP returned \(noopEvents.count) events")
                         for event in noopEvents {
                             continuation.yield(event)
                         }
