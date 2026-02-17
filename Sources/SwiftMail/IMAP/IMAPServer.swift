@@ -383,10 +383,17 @@ public actor IMAPServer {
     /// The returned session must be ended by calling `done()` on the session,
     /// or by calling `disconnect()` on the server.
     ///
+    /// Internally cycles DONE → NOOP → re-IDLE every `idleCycleInterval` seconds
+    /// to keep the connection alive and collect any buffered server-side changes.
+    /// The cycling is transparent — events from both IDLE and NOOP responses are
+    /// forwarded into the single `events` stream.
+    ///
     /// - Important: If other connections have the same mailbox selected, refresh them
     ///   (for example by issuing `noop()`) when this session reports changes, to keep
     ///   counts and sequence numbers accurate across connections.
-    public func idle(on mailbox: String) async throws -> IMAPIdleSession {
+    /// - Parameter mailbox: The mailbox to watch for changes.
+    /// - Parameter cycleInterval: Seconds between IDLE cycles (default 240 = 4 minutes).
+    public func idle(on mailbox: String, cycleInterval: TimeInterval = 240) async throws -> IMAPIdleSession {
         guard let authentication = authentication else {
             throw IMAPError.commandFailed("Authentication required before starting IDLE on a mailbox")
         }
@@ -399,9 +406,96 @@ public actor IMAPServer {
             try await connection.connect()
             try await authentication.authenticate(on: connection)
             _ = try await connection.executeCommand(SelectMailboxCommand(mailboxName: mailbox))
-            let events = try await connection.idle()
 
-            let session = IMAPIdleSession(events: events) { [weak self] in
+            // Create a wrapper stream that we control
+            var continuationRef: AsyncStream<IMAPServerEvent>.Continuation!
+            let wrappedEvents = AsyncStream<IMAPServerEvent> { continuation in
+                continuationRef = continuation
+            }
+
+            let continuation = continuationRef!
+
+            // Start the cycling task
+            let cycleTask = Task.detached {
+                func log(_ msg: String) {
+                    if let data = ("[IdleCycle] \(msg)\n").data(using: .utf8) {
+                        try? FileHandle.standardError.write(contentsOf: data)
+                    }
+                }
+                do {
+                    var cycleCount = 0
+                    log("cycling task started, interval=\(cycleInterval)s")
+                    while !Task.isCancelled {
+                        cycleCount += 1
+                        log("cycle \(cycleCount): starting IDLE")
+                        // Start IDLE
+                        let idleStream = try await connection.idle()
+                        log("cycle \(cycleCount): IDLE started, waiting for events")
+
+                        // Forward events until timeout or stream ends.
+                        // Returns true if server sent BYE (stop cycling).
+                        let gotBye = await withTaskGroup(of: Bool.self) { group -> Bool in
+                            // Timer: after cycleInterval, send DONE to break the IDLE
+                            group.addTask {
+                                do {
+                                    try await Task.sleep(nanoseconds: UInt64(cycleInterval * 1_000_000_000))
+                                    log("cycle \(cycleCount): timer expired, sending DONE")
+                                    // Timeout reached — send DONE to end IDLE.
+                                    // This causes the server to send tagged OK,
+                                    // which finishes the idleStream.
+                                    try? await connection.done()
+                                    log("cycle \(cycleCount): DONE sent")
+                                } catch {
+                                    // Task cancelled
+                                }
+                                return false  // Timer task never indicates BYE
+                            }
+
+                            // Event consumer: forward events to wrapper stream
+                            group.addTask {
+                                for await event in idleStream {
+                                        log("cycle \(cycleCount): got event: \(String(describing: event))")
+                                    continuation.yield(event)
+                                    if case .bye = event {
+                                        return true  // Server-initiated close
+                                    }
+                                }
+                                log("cycle \(cycleCount): event stream ended")
+                                return false  // Stream ended normally (DONE was sent)
+                            }
+
+                            // Collect results. The event consumer finishes when
+                            // the timer sends DONE (closing the stream) or on BYE.
+                            var bye = false
+                            for await taskResult in group {
+                                if taskResult {
+                                    bye = true
+                                    group.cancelAll()
+                                    break
+                                }
+                            }
+                            return bye
+                        }
+
+                        if Task.isCancelled || gotBye { break }
+
+                        // NOOP to collect any buffered untagged responses
+                        log("cycle \(cycleCount): sending NOOP")
+                        let noopEvents = try await connection.noop()
+                        log("cycle \(cycleCount): NOOP returned \(noopEvents.count) events")
+                        for event in noopEvents {
+                            continuation.yield(event)
+                        }
+                    }
+                } catch {
+                    // Connection error — let the stream end
+                }
+
+                continuation.finish()
+            }
+
+            let session = IMAPIdleSession(events: wrappedEvents) { [weak self] in
+                cycleTask.cancel()
                 guard let self else { return }
                 try await self.endIdleSession(id: sessionID)
             }

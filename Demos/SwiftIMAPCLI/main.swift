@@ -580,14 +580,16 @@ struct DownloadAttachment: ParsableCommand {
 }
 
 struct Idle: ParsableCommand {
-    static let configuration = CommandConfiguration(abstract: "Watch for new emails (IDLE)")
+    static let configuration = CommandConfiguration(abstract: "Watch for IMAP IDLE events (all types)")
     
     @Option(name: .shortAndLong, help: "Mailbox")
     var mailbox: String = "INBOX"
+    
+    @Option(name: .shortAndLong, help: "IDLE cycle interval in seconds (DONE → NOOP → re-IDLE)")
+    var cycle: Int = 240
 
     func run() throws {
         runAsyncBlock {
-            // Idle is special
             try Dotenv.configure()
             
             guard case let .string(host) = Dotenv["IMAP_HOST"],
@@ -600,21 +602,43 @@ struct Idle: ParsableCommand {
             let server = IMAPServer(host: host, port: port)
             try await server.connect()
             try await server.login(username: username, password: password)
-            // No defer disconnect as we run indefinitely
             
             let status = try await server.selectMailbox(mailbox)
-            print("Listening on \(mailbox)... (CTRL+C to stop)")
+            print("📬 \(mailbox): \(status.messageCount) messages")
+            print("Listening for IDLE events (cycle: \(cycle)s, Ctrl+C to stop)...\n")
             
-            let idleSession = try await server.idle(on: mailbox)
+            let idleSession = try await server.idle(on: mailbox, cycleInterval: TimeInterval(cycle))
             
-            var lastExists = status.messageCount
+            let formatter = DateFormatter()
+            formatter.dateFormat = "HH:mm:ss"
             
             for await event in idleSession.events {
-                if case .exists(let count) = event, count > lastExists {
-                     print("🔔 New message! (Count: \(count))")
-                     lastExists = count
+                let ts = formatter.string(from: Date())
+                switch event {
+                case .exists(let count):
+                    print("[\(ts)] 📩 EXISTS count=\(count)")
+                case .expunge(let seq):
+                    print("[\(ts)] 🗑️  EXPUNGE seq=\(seq.value)")
+                case .recent(let count):
+                    print("[\(ts)] 🆕 RECENT count=\(count)")
+                case .fetch(let seq, let attrs):
+                    let flags = attrs.compactMap { attr -> String? in
+                        if case .flags(let f) = attr { return f.map(String.init).joined(separator: ", ") }
+                        return nil
+                    }.first ?? ""
+                    print("[\(ts)] 📋 FETCH seq=\(seq.value) flags=[\(flags)]")
+                case .bye(let text):
+                    print("[\(ts)] 👋 BYE: \(text)")
+                case .alert(let text):
+                    print("[\(ts)] ⚠️  ALERT: \(text)")
+                case .capability(let caps):
+                    print("[\(ts)] 🔧 CAPABILITY: \(caps.joined(separator: " "))")
                 }
             }
+            
+            print("\nIDLE stream ended.")
+            try? await idleSession.done()
+            try? await server.disconnect()
         }
     }
 }
