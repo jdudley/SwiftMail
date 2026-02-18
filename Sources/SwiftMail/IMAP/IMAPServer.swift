@@ -1584,7 +1584,16 @@ extension IMAPServer {
             targetMailbox = try draftsFolder.name
         }
 
-        return try await append(email: email, to: targetMailbox, flags: flags, internalDate: date)
+        // Mark as a draft so mail clients (e.g. Apple Mail) recognize ownership
+        // and remove the message from Drafts after sending.
+        var draft = email
+        var headers = draft.additionalHeaders ?? [:]
+        if headers["X-Uniform-Type-Identifier"] == nil {
+            headers["X-Uniform-Type-Identifier"] = "com.apple.mail-draft"
+        }
+        draft.additionalHeaders = headers
+
+        return try await append(email: draft, to: targetMailbox, flags: flags, internalDate: date)
     }
 }
 
