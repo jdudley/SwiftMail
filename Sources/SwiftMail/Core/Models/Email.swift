@@ -31,6 +31,9 @@ public struct Email: Sendable {
     /** Optional attachments for the email */
     public var attachments: [Attachment]?
     
+    /** Optional additional headers (e.g. Message-Id, X-Custom-Header) */
+    public var additionalHeaders: [String: String]?
+    
     /**
      Initialize a new email with EmailAddress objects
      - Parameters:

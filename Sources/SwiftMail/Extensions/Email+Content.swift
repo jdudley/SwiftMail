@@ -28,7 +28,15 @@ extension Email {
         }
 
         content += "Subject: \(self.subject)\r\n"
+        content += "Date: \(Self.rfc2822Date())\r\n"
+        content += "Message-Id: <\(UUID().uuidString)@\(Self.senderDomain(from: self.sender))>\r\n"
         content += "MIME-Version: 1.0\r\n"
+
+        if let additionalHeaders {
+            for (key, value) in additionalHeaders.sorted(by: { $0.key < $1.key }) {
+                content += "\(key): \(value)\r\n"
+            }
+        }
 
         let mainBoundary = "SwiftSMTP-Boundary-\(UUID().uuidString)"
         let altBoundary = "SwiftSMTP-Alt-Boundary-\(UUID().uuidString)"
@@ -218,5 +226,24 @@ extension Email {
         }
         
         return content
+    }
+
+    /// Formats the current date in RFC 2822 format for the Date header.
+    private static func rfc2822Date() -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss Z"
+        return formatter.string(from: Date())
+    }
+
+    /// Extracts the domain from the sender address for Message-Id generation.
+    private static func senderDomain(from sender: EmailAddress) -> String {
+        if let atIndex = sender.address.lastIndex(of: "@") {
+            let domain = sender.address[sender.address.index(after: atIndex)...]
+            if !domain.isEmpty {
+                return String(domain)
+            }
+        }
+        return "localhost"
     }
 } 
