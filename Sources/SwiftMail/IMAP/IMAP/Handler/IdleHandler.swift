@@ -22,13 +22,11 @@ final class IdleHandler: BaseIMAPCommandHandler<Void>, IMAPCommandHandler, @unch
         fatalError("Use init(commandTag:promise:continuation:) instead")
     }
 
-    	override func handleTaggedOKResponse(_ response: TaggedResponse) {
-		// Call super to handle CLIENTBUG warnings
-		super.handleTaggedOKResponse(response)
-		
-		succeedWithResult(())
-		continuation.finish()
-	}
+    override func handleTaggedOKResponse(_ response: TaggedResponse) {
+        // Call super to handle CLIENTBUG warnings and fulfill the Void promise.
+        super.handleTaggedOKResponse(response)
+        continuation.finish()
+    }
 
     override func handleTaggedErrorResponse(_ response: TaggedResponse) {
         failWithError(IMAPError.commandFailed(String(describing: response.state)))
@@ -42,7 +40,9 @@ final class IdleHandler: BaseIMAPCommandHandler<Void>, IMAPCommandHandler, @unch
     override func handleUntaggedResponse(_ response: Response) -> Bool {
         switch response {
         case .idleStarted:
-            return true
+            // IDLE confirmation does not complete the command. We must remain
+            // installed to receive untagged events and the final tagged OK after DONE.
+            return false
         case .untagged(let payload):
             return handlePayload(payload)
         case .fetch(let fetch):

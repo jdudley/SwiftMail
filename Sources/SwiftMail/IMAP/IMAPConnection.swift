@@ -169,15 +169,25 @@ final class IMAPConnection {
         }
 
         do {
-            try await channel.writeAndFlush(IMAPClientHandler.OutboundIn.part(.idleDone)).get()
-        } catch {
-            logger.warning("Failed to send DONE: \(error)")
-        }
-
-        do {
+            _ = try await waitForFutureWithTimeout(
+                channel.writeAndFlush(IMAPClientHandler.OutboundIn.part(.idleDone)),
+                timeoutSeconds: timeoutSeconds
+            )
             try await waitForIdleHandlerCompletion(handler, timeoutSeconds: timeoutSeconds)
+            duplexLogger.flushInboundBuffer()
         } catch {
-            logger.warning("Timed out waiting for IDLE termination after DONE")
+            duplexLogger.flushInboundBuffer()
+
+            if error is CancellationError {
+                throw error
+            }
+
+            if let imapError = error as? IMAPError, case .timeout = imapError {
+                logger.warning("Timed out waiting for IDLE termination after DONE")
+            } else {
+                logger.warning("Failed to terminate IDLE after DONE: \(error)")
+            }
+
             try? await disconnect()
             throw error
         }
@@ -410,26 +420,28 @@ final class IMAPConnection {
     }
 
     private func waitForIdleHandlerCompletion(_ handler: IdleHandler, timeoutSeconds: TimeInterval) async throws {
-        let timeout = max(timeoutSeconds, 0.1)
-        let timeoutNanoseconds = UInt64(timeout * 1_000_000_000)
-        let pollNanoseconds: UInt64 = 100_000_000  // 100ms
+        _ = try await waitForFutureWithTimeout(handler.promise.futureResult, timeoutSeconds: timeoutSeconds)
+    }
 
-        var elapsed: UInt64 = 0
-        while !handler.isCompleted {
-            if Task.isCancelled {
-                throw CancellationError()
-            }
-            if elapsed >= timeoutNanoseconds {
-                throw IMAPError.timeout
-            }
-
-            let remaining = timeoutNanoseconds - elapsed
-            let sleepNanos = min(pollNanoseconds, remaining)
-            try await Task.sleep(nanoseconds: sleepNanos)
-            elapsed += sleepNanos
+    private func waitForFutureWithTimeout<T: Sendable>(
+        _ future: EventLoopFuture<T>,
+        timeoutSeconds: TimeInterval
+    ) async throws -> T {
+        if Task.isCancelled {
+            throw CancellationError()
         }
 
-        try await handler.promise.futureResult.get()
+        let timeout = max(timeoutSeconds, 0.1)
+        let timeoutMilliseconds = max(Int64(timeout * 1_000), 100)
+        let timeoutPromise = future.eventLoop.makePromise(of: T.self)
+        let timeoutTask = future.eventLoop.scheduleTask(in: .milliseconds(timeoutMilliseconds)) {
+            timeoutPromise.fail(IMAPError.timeout)
+        }
+
+        defer { timeoutTask.cancel() }
+
+        future.cascade(to: timeoutPromise)
+        return try await timeoutPromise.futureResult.get()
     }
 
     private func makeXOAUTH2InitialResponseBuffer(email: String, accessToken: String) -> ByteBuffer {
