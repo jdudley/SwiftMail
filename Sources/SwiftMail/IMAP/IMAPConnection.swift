@@ -284,9 +284,19 @@ final class IMAPConnection {
     private func refreshCapabilities(using reportedCapabilities: [Capability]) async throws {
         if !reportedCapabilities.isEmpty {
             self.capabilities = Set(reportedCapabilities)
-        } else {
-            try await fetchCapabilities()
+            return
         }
+
+        // Some servers (notably Gmail) do not advertise capabilities in the greeting
+        // or auth response. This path can run while the command queue is already held
+        // (e.g. reconnect + reauth), so avoid re-entering executeCommand().
+        try await refreshCapabilitiesWithoutQueue()
+    }
+
+    private func refreshCapabilitiesWithoutQueue() async throws {
+        let command = CapabilityCommand()
+        let serverCapabilities = try await executeCommandBody(command)
+        self.capabilities = Set(serverCapabilities)
     }
 
     private func authenticateXOAUTH2Body(email: String, accessToken: String) async throws {
