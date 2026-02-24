@@ -33,6 +33,67 @@ struct QuotedPrintableTests {
             throw TestFailure("Failed to load resource content: \(error)")
         }
     }
+
+    func normalizedLF(_ value: String) -> String {
+        return value
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+    }
+
+    // MARK: - Body Encoding Tests
+
+    @Test("Body encoding never maps spaces to underscores", .tags(.encoding))
+    func bodyEncodingDoesNotUseUnderscoresForSpaces() {
+        let input = "Hello World from SwiftMail"
+        let encoded = input.quotedPrintableEncoded()
+
+        #expect(encoded == input)
+        #expect(!encoded.contains("_"))
+    }
+
+    @Test("Body encoding wraps long lines at 76 chars with soft breaks", .tags(.encoding))
+    func bodyEncodingWrapsLongLinesWithSoftBreaks() {
+        let input = String(repeating: "A", count: 220)
+        let encoded = input.quotedPrintableEncoded()
+
+        #expect(encoded.contains("=\r\n"))
+
+        let physicalLines = encoded.components(separatedBy: "\r\n")
+        #expect(physicalLines.count > 1)
+
+        for index in physicalLines.indices {
+            let line = physicalLines[index]
+            #expect(line.count <= 76)
+
+            if index < physicalLines.count - 1 {
+                #expect(line.hasSuffix("="), "Wrapped line should end with soft-break marker '='")
+            }
+        }
+    }
+
+    @Test("Body encoding encodes trailing spaces and tabs", .tags(.encoding))
+    func bodyEncodingEncodesTrailingWhitespace() {
+        let input = "Line with trailing space \nLine with trailing tab\t\nFinal line with both \t"
+        let encoded = input.quotedPrintableEncoded()
+        let lines = encoded.components(separatedBy: "\r\n")
+
+        #expect(lines.count == 3)
+        #expect(lines[0].hasSuffix("=20"))
+        #expect(lines[1].hasSuffix("=09"))
+        #expect(lines[2].hasSuffix("=09"))
+        #expect(!encoded.contains("_"))
+    }
+
+    @Test("UTF-8 body roundtrip through quoted-printable encoding", .tags(.encoding, .decoding))
+    func utf8BodyRoundtrip() {
+        let original = "Hello café 😀\n日本語とemoji 👍"
+        let encoded = original.quotedPrintableEncoded()
+        let decoded = encoded.decodeQuotedPrintable()
+
+        #expect(encoded.contains("\r\n"))
+        #expect(decoded.map(normalizedLF) == normalizedLF(original))
+        #expect(!encoded.contains("_"))
+    }
     
     // MARK: - Basic Decoding Tests
     
@@ -88,6 +149,10 @@ struct QuotedPrintableTests {
         // Test Q-encoded header
         let qEncoded = "=?UTF-8?Q?Hello=20World?="
         #expect(qEncoded.decodeMIMEHeader() == "Hello World")
+
+        // Header Q-decoding should still map underscores to spaces
+        let qEncodedUnderscore = "=?UTF-8?Q?Hello_World?="
+        #expect(qEncodedUnderscore.decodeMIMEHeader() == "Hello World")
         
         // Test B-encoded header
         let bEncoded = "=?UTF-8?B?SGVsbG8gV29ybGQ=?="

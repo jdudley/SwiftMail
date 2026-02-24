@@ -6,20 +6,96 @@ import CoreFoundation
 extension String {
     /// Encodes the string using quoted-printable encoding
     public func quotedPrintableEncoded() -> String {
-        var encoded = ""
-        let allowedCharacters = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!*+-/=_ ")
+        struct Token {
+            let value: String
+            let isLiteralWhitespace: Bool
+        }
 
-        for char in utf8 {
-            if allowedCharacters.contains(UnicodeScalar(char)) && char != UInt8(ascii: " ") {
-                encoded.append(Character(UnicodeScalar(char)))
-            } else if char == UInt8(ascii: " ") {
-                encoded.append("_")
-            } else {
-                encoded.append(String(format: "=%02X", char))
+        let maxLineLength = 76
+        let maxContentLengthForSoftBreak = maxLineLength - 1 // Reserve one char for '=' soft-break marker
+
+        let normalizedLineEndings = self
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+        let logicalLines = normalizedLineEndings.split(separator: "\n", omittingEmptySubsequences: false)
+
+        func token(for byte: UInt8, isEndOfLogicalLine: Bool) -> Token {
+            switch byte {
+            case UInt8(ascii: "="):
+                return Token(value: "=3D", isLiteralWhitespace: false)
+            case UInt8(ascii: " "):
+                if isEndOfLogicalLine {
+                    return Token(value: "=20", isLiteralWhitespace: false)
+                }
+                return Token(value: " ", isLiteralWhitespace: true)
+            case UInt8(ascii: "\t"):
+                if isEndOfLogicalLine {
+                    return Token(value: "=09", isLiteralWhitespace: false)
+                }
+                return Token(value: "\t", isLiteralWhitespace: true)
+            case 33...60, 62...126:
+                return Token(value: String(UnicodeScalar(byte)), isLiteralWhitespace: false)
+            default:
+                return Token(value: String(format: "=%02X", byte), isLiteralWhitespace: false)
             }
         }
 
-        return encoded
+        func encodeLogicalLine(_ line: Substring) -> String {
+            let bytes = Array(line.utf8)
+            var encodedTokens: [Token] = []
+            encodedTokens.reserveCapacity(bytes.count)
+
+            for (index, byte) in bytes.enumerated() {
+                encodedTokens.append(token(for: byte, isEndOfLogicalLine: index == bytes.count - 1))
+            }
+
+            var wrappedLines: [String] = []
+            var currentTokens: [Token] = []
+            var currentLength = 0
+
+            func flushWithSoftBreak() {
+                guard !currentTokens.isEmpty else {
+                    return
+                }
+
+                var carriedTokens: [Token] = []
+
+                while let last = currentTokens.last, last.isLiteralWhitespace {
+                    _ = currentTokens.popLast()
+                    currentLength -= last.value.count
+
+                    let encodedWhitespace = Token(
+                        value: last.value == " " ? "=20" : "=09",
+                        isLiteralWhitespace: false
+                    )
+
+                    if currentLength + encodedWhitespace.value.count <= maxContentLengthForSoftBreak {
+                        currentTokens.append(encodedWhitespace)
+                        currentLength += encodedWhitespace.value.count
+                    } else {
+                        carriedTokens.insert(encodedWhitespace, at: 0)
+                    }
+                }
+
+                wrappedLines.append(currentTokens.map(\.value).joined() + "=")
+                currentTokens = carriedTokens
+                currentLength = carriedTokens.reduce(0) { $0 + $1.value.count }
+            }
+
+            for token in encodedTokens {
+                if currentLength + token.value.count > maxContentLengthForSoftBreak {
+                    flushWithSoftBreak()
+                }
+
+                currentTokens.append(token)
+                currentLength += token.value.count
+            }
+
+            wrappedLines.append(currentTokens.map(\.value).joined())
+            return wrappedLines.joined(separator: "\r\n")
+        }
+
+        return logicalLines.map(encodeLogicalLine).joined(separator: "\r\n")
     }
 
     /// Decodes a quoted-printable encoded string by removing "soft line" breaks and replacing all
