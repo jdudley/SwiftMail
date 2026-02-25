@@ -85,6 +85,49 @@ struct XOAUTH2AuthenticationHandlerTests {
         #expect(capabilities.isEmpty)
     }
 
+
+    @Test
+    func testSASLIRServerSendsEmptyChallengeRetriesCredentials() async throws {
+        let (channel, promise, _) = try await setUpChannel(tag: "A002A", expectsChallenge: false)
+        defer { _ = try? channel.finish() }
+
+        let command = TaggedCommand(
+            tag: "A002A",
+            command: .authenticate(
+                mechanism: AuthenticationMechanism("XOAUTH2"),
+                initialResponse: InitialResponse(makeCredentialBuffer(using: channel.allocator))
+            )
+        )
+
+        try await channel.writeAndFlush(IMAPClientHandler.OutboundIn.part(.tagged(command)))
+
+        guard var firstOutbound = try channel.readOutbound(as: ByteBuffer.self) else {
+            Issue.record("Expected AUTHENTICATE command")
+            return
+        }
+        let firstLine = firstOutbound.readString(length: firstOutbound.readableBytes)
+        let expectedBase64 = makeBase64String()
+        #expect(firstLine == "A002A AUTHENTICATE XOAUTH2 \(expectedBase64)\r\n")
+
+        var challengeBuffer = channel.allocator.buffer(capacity: 0)
+        challengeBuffer.writeString("+ \r\n")
+        try channel.writeInbound(challengeBuffer)
+
+        guard var continuation = try channel.readOutbound(as: ByteBuffer.self) else {
+            Issue.record("Expected XOAUTH2 continuation retry data")
+            return
+        }
+        let continuationLine = continuation.readString(length: continuation.readableBytes)
+        #expect(continuationLine == "\(expectedBase64)\r\n")
+
+        var okBuffer = channel.allocator.buffer(capacity: 0)
+        okBuffer.writeString("A002A OK AUTHENTICATE completed\r\n")
+        try channel.writeInbound(okBuffer)
+
+        let capabilities = try await promise.futureResult.get()
+        #expect(capabilities.isEmpty)
+    }
+
     @Test
     func testServerErrorBlobTriggersAuthFailure() async throws {
         let (channel, promise, _) = try await setUpChannel(tag: "A003", expectsChallenge: false)

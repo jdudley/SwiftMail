@@ -425,7 +425,8 @@ final class IMAPConnection {
 
         let authenticationTimeoutSeconds = 10
         let logger = self.logger
-        let scheduledTask = group.next().scheduleTask(in: .seconds(Int64(authenticationTimeoutSeconds))) {
+        // Schedule on the channel event loop to avoid cross-loop promise completion.
+        let scheduledTask = channel.eventLoop.scheduleTask(in: .seconds(Int64(authenticationTimeoutSeconds))) {
             logger.warning("XOAUTH2 authentication timed out after \(authenticationTimeoutSeconds) seconds")
             handlerPromise.fail(IMAPError.timeout)
         }
