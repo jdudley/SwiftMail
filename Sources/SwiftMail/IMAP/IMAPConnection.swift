@@ -668,7 +668,7 @@ final class IMAPConnection {
         let timeoutSeconds = command.timeoutSeconds
 
         let logger = self.logger
-        let scheduledTask = group.next().scheduleTask(in: .seconds(Int64(timeoutSeconds))) {
+        let scheduledTask = channel.eventLoop.scheduleTask(in: .seconds(Int64(timeoutSeconds))) {
             logger.warning("Command timed out after \(timeoutSeconds) seconds")
             resultPromise.fail(IMAPError.timeout)
         }
@@ -722,7 +722,7 @@ final class IMAPConnection {
         let handler = HandlerType.init(commandTag: "", promise: resultPromise)
 
         let logger = self.logger
-        let scheduledTask = group.next().scheduleTask(in: .seconds(Int64(timeoutSeconds))) {
+        let scheduledTask = channel.eventLoop.scheduleTask(in: .seconds(Int64(timeoutSeconds))) {
             logger.warning("Handler execution timed out after \(timeoutSeconds) seconds")
             resultPromise.fail(IMAPError.timeout)
         }
