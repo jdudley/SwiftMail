@@ -457,7 +457,6 @@ final class IMAPConnection {
             await handleConnectionTerminationInResponses(handler.untaggedResponses)
             duplexLogger.flushInboundBuffer()
 
-<<<<<<< HEAD
             isSessionAuthenticated = true
             if !refreshedCapabilities.isEmpty {
                 self.capabilities = Set(refreshedCapabilities)
