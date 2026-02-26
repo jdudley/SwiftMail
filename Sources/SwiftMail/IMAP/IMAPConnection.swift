@@ -173,7 +173,23 @@ final class IMAPConnection {
             return
         }
 
+        if handler.isCompleted {
+            logger.debug("\(connectionContext) IDLE already completed, skipping DONE command")
+            idleHandler = nil
+            responseBuffer.hasActiveHandler = false
+            return
+        }
+
         guard let channel = self.channel, channel.isActive else {
+            let terminationReasons = responseBuffer.consumeBufferedConnectionTerminationReasons()
+            if !terminationReasons.isEmpty {
+                let reason = terminationReasons.joined(separator: " | ")
+                logger.info("\(connectionContext) Skipping DONE because server already closed connection: \(reason)")
+                idleHandler = nil
+                responseBuffer.hasActiveHandler = false
+                return
+            }
+
             logger.warning("\(connectionContext) Cannot send DONE because channel is not active")
             idleHandler = nil
             responseBuffer.hasActiveHandler = false
@@ -203,11 +219,17 @@ final class IMAPConnection {
             duplexLogger.flushInboundBuffer()
         } catch {
             duplexLogger.flushInboundBuffer()
-            logErrorDiagnostics(error: error, operation: "DONE")
 
             if error is CancellationError {
                 throw error
             }
+
+            if handler.isCompleted {
+                logger.info("\(connectionContext) Server closed connection while IDLE termination was in progress")
+                return
+            }
+
+            logErrorDiagnostics(error: error, operation: "DONE")
 
             if let imapError = error as? IMAPError, case .timeout = imapError {
                 logger.warning("\(connectionContext) Timed out waiting for IDLE termination after DONE")

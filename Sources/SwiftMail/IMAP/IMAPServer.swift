@@ -527,7 +527,7 @@ public actor IMAPServer {
 
                 enum CycleResult {
                     case timer(CycleTrigger)
-                    case streamEnded(sawBye: Bool)
+                    case streamEnded(sawBye: Bool, byeMessage: String?)
                 }
 
                 let cycleLoggerLabel = "com.cocoanetics.SwiftMail.IdleCycle.\(connection.identifier)"
@@ -575,14 +575,16 @@ public actor IMAPServer {
                         let cycleResult = await withTaskGroup(of: CycleResult.self) { group -> CycleResult in
                             group.addTask {
                                 var sawBye = false
+                                var byeMessage: String?
                                 for await event in idleStream {
                                     continuation.yield(event)
-                                    if case .bye = event {
+                                    if case .bye(let message) = event {
                                         sawBye = true
+                                        byeMessage = message
                                         break
                                     }
                                 }
-                                return .streamEnded(sawBye: sawBye)
+                                return .streamEnded(sawBye: sawBye, byeMessage: byeMessage)
                             }
 
                             group.addTask {
@@ -592,7 +594,7 @@ public actor IMAPServer {
                                 return .timer(trigger)
                             }
 
-                            let first = await group.next() ?? .streamEnded(sawBye: false)
+                            let first = await group.next() ?? .streamEnded(sawBye: false, byeMessage: nil)
                             group.cancelAll()
                             return first
                         }
@@ -600,9 +602,39 @@ public actor IMAPServer {
                         if Task.isCancelled { break }
 
                         switch cycleResult {
-                        case .streamEnded(let sawBye):
+                        case .streamEnded(let sawBye, let byeMessage):
                             if sawBye {
-                                cycleLogger.warning("Cycle \(cycleCount): server sent BYE during IDLE; reconnecting")
+                                let message = byeMessage ?? "<no message>"
+                                cycleLogger.info("Cycle \(cycleCount): Server closed connection: \(message)")
+
+                                do {
+                                    try? await connection.disconnect()
+
+                                    try await connection.connect()
+                                    try await authentication.authenticate(on: connection)
+                                    _ = try await connection.executeCommand(SelectMailboxCommand(mailboxName: mailbox))
+
+                                    let reconnectedAt = Date()
+                                    nextNoopAt = idleConfiguration.postIdleNoopEnabled
+                                        ? reconnectedAt.addingTimeInterval(idleConfiguration.noopInterval)
+                                        : nil
+                                    nextRenewalAt = reconnectedAt.addingTimeInterval(idleConfiguration.renewalInterval)
+                                    reconnectAttempt = 0
+
+                                    cycleLogger.info("Reconnected IDLE session for mailbox '\(mailbox)'")
+                                    continue
+                                } catch {
+                                    reconnectAttempt += 1
+                                    let delay = reconnectDelay(reconnectAttempt)
+                                    cycleLogger.info(
+                                        "Cycle \(cycleCount): routine reconnect failed after server close '\(String(describing: error))'; retry \(reconnectAttempt) in \(delay)s"
+                                    )
+
+                                    if delay > 0 {
+                                        try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                                    }
+                                    continue
+                                }
                             } else {
                                 cycleLogger.warning("Cycle \(cycleCount): IDLE stream ended unexpectedly; reconnecting")
                             }
@@ -642,8 +674,40 @@ public actor IMAPServer {
                                 return false
                             }
                             if sawByeEvent {
-                                cycleLogger.warning("Cycle \(cycleCount): observed BYE during checkpoint processing; reconnecting")
-                                throw IMAPConnectionError.disconnected
+                                let byeMessage = (noopEvents + bufferedEvents).compactMap { event -> String? in
+                                    guard case .bye(let message) = event else { return nil }
+                                    return message ?? "<no message>"
+                                }.first ?? "<no message>"
+                                cycleLogger.info("Cycle \(cycleCount): Server closed connection: \(byeMessage)")
+
+                                do {
+                                    try? await connection.disconnect()
+
+                                    try await connection.connect()
+                                    try await authentication.authenticate(on: connection)
+                                    _ = try await connection.executeCommand(SelectMailboxCommand(mailboxName: mailbox))
+
+                                    let reconnectedAt = Date()
+                                    nextNoopAt = idleConfiguration.postIdleNoopEnabled
+                                        ? reconnectedAt.addingTimeInterval(idleConfiguration.noopInterval)
+                                        : nil
+                                    nextRenewalAt = reconnectedAt.addingTimeInterval(idleConfiguration.renewalInterval)
+                                    reconnectAttempt = 0
+
+                                    cycleLogger.info("Reconnected IDLE session for mailbox '\(mailbox)'")
+                                    continue
+                                } catch {
+                                    reconnectAttempt += 1
+                                    let delay = reconnectDelay(reconnectAttempt)
+                                    cycleLogger.info(
+                                        "Cycle \(cycleCount): routine reconnect failed after server close '\(String(describing: error))'; retry \(reconnectAttempt) in \(delay)s"
+                                    )
+
+                                    if delay > 0 {
+                                        try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                                    }
+                                    continue
+                                }
                             }
 
                             let resumedAt = Date()
