@@ -9,8 +9,10 @@ final class XOAUTH2AuthenticationHandler: BaseIMAPCommandHandler<[Capability]>, 
     private var collectedCapabilities: [Capability] = []
     private var shouldSendCredentialsOnChallenge: Bool
     private var credentials: ByteBuffer
+    private let sentInlineInitialResponse: Bool
     private let serverLogger: Logger
     private var lastServerError: String?
+    private var fallbackContinuationSent = false
 
     init(
         commandTag: String,
@@ -22,6 +24,7 @@ final class XOAUTH2AuthenticationHandler: BaseIMAPCommandHandler<[Capability]>, 
         self.credentials = credentials
         self.shouldSendCredentialsOnChallenge = expectsChallenge
         self.serverLogger = logger
+        self.sentInlineInitialResponse = !expectsChallenge
         super.init(commandTag: commandTag, promise: promise)
     }
 
@@ -40,9 +43,19 @@ final class XOAUTH2AuthenticationHandler: BaseIMAPCommandHandler<[Capability]>, 
     }
 
     private func handleAuthenticationChallenge(_ challenge: inout ByteBuffer, context: ChannelHandlerContext) {
+        let challengeText = challenge.getString(at: challenge.readerIndex, length: challenge.readableBytes) ?? ""
+        let challengeIsEmpty = challengeText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+
         let sendCredentials = lock.withLock { () -> Bool in
             if shouldSendCredentialsOnChallenge {
                 shouldSendCredentialsOnChallenge = false
+                return true
+            }
+
+            // Compatibility fallback: some servers advertise SASL-IR but still emit an
+            // empty continuation before consuming credentials. Allow one retry.
+            if sentInlineInitialResponse && !fallbackContinuationSent && challengeIsEmpty {
+                fallbackContinuationSent = true
                 return true
             }
             return false
@@ -58,9 +71,9 @@ final class XOAUTH2AuthenticationHandler: BaseIMAPCommandHandler<[Capability]>, 
             return
         }
 
-        if let message = challenge.readString(length: challenge.readableBytes), !message.isEmpty {
-            lock.withLock { lastServerError = message }
-            serverLogger.error("XOAUTH2 server error: \(message)")
+        if !challengeText.isEmpty {
+            lock.withLock { lastServerError = challengeText }
+            serverLogger.error("XOAUTH2 server error: \(challengeText)")
         } else {
             lock.withLock { lastServerError = nil }
         }

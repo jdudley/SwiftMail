@@ -424,11 +424,19 @@ final class IMAPConnection {
             throw IMAPError.connectionFailed("Channel not initialized")
         }
 
-        let expectsChallenge = !capabilities.contains(.saslIR)
         let tag = generateCommandTag()
 
         let handlerPromise = channel.eventLoop.makePromise(of: [Capability].self)
         let credentialBuffer = makeXOAUTH2InitialResponseBuffer(email: email, accessToken: accessToken)
+
+        let supportsSASLIR = capabilities.contains(.saslIR)
+        let saslIRInlineLimitBytes = 1024
+        let shouldUseInlineInitialResponse = supportsSASLIR && credentialBuffer.readableBytes <= saslIRInlineLimitBytes
+        let expectsChallenge = !shouldUseInlineInitialResponse
+
+        if supportsSASLIR && !shouldUseInlineInitialResponse {
+            logger.info("XOAUTH2 payload size \(credentialBuffer.readableBytes) exceeds inline SASL-IR limit \(saslIRInlineLimitBytes); switching to continuation mode")
+        }
         let handler = XOAUTH2AuthenticationHandler(
             commandTag: tag,
             promise: handlerPromise,
@@ -440,14 +448,24 @@ final class IMAPConnection {
         try await channel.pipeline.addHandler(handler, position: .before(responseBuffer)).get()
         responseBuffer.hasActiveHandler = true
 
-        let initialResponse = expectsChallenge ? nil : InitialResponse(credentialBuffer)
+        let initialResponse: InitialResponse?
+        if shouldUseInlineInitialResponse {
+            initialResponse = InitialResponse(credentialBuffer)
+        } else if supportsSASLIR {
+            // Use true continuation mode for oversized payloads.
+            // Sending an explicit empty SASL-IR ("=") can be interpreted as an empty credential attempt.
+            initialResponse = nil
+        } else {
+            initialResponse = nil
+        }
 
         let command = TaggedCommand(tag: tag, command: .authenticate(mechanism: mechanism, initialResponse: initialResponse))
         let wrapped = IMAPClientHandler.OutboundIn.part(CommandStreamPart.tagged(command))
 
         let authenticationTimeoutSeconds = 10
         let logger = self.logger
-        let scheduledTask = group.next().scheduleTask(in: .seconds(Int64(authenticationTimeoutSeconds))) {
+        // Schedule on the channel event loop to avoid cross-loop promise completion.
+        let scheduledTask = channel.eventLoop.scheduleTask(in: .seconds(Int64(authenticationTimeoutSeconds))) {
             logger.warning("XOAUTH2 authentication timed out after \(authenticationTimeoutSeconds) seconds")
             handlerPromise.fail(IMAPError.timeout)
         }
@@ -462,7 +480,14 @@ final class IMAPConnection {
             duplexLogger.flushInboundBuffer()
 
             isSessionAuthenticated = true
-            try await refreshCapabilities(using: refreshedCapabilities)
+            if !refreshedCapabilities.isEmpty {
+                self.capabilities = Set(refreshedCapabilities)
+            } else {
+                // AUTHENTICATE often returns an OK without CAPABILITY data.
+                // Avoid issuing a follow-up CAPABILITY command here because we're already
+                // inside commandQueue.run, and a nested executeCommand would deadlock.
+                logger.debug("XOAUTH2 completed without capability data; retaining existing capability snapshot")
+            }
         } catch {
             scheduledTask.cancel()
             responseBuffer.hasActiveHandler = false
@@ -689,7 +714,7 @@ final class IMAPConnection {
         let timeoutSeconds = command.timeoutSeconds
 
         let logger = self.logger
-        let scheduledTask = group.next().scheduleTask(in: .seconds(Int64(timeoutSeconds))) {
+        let scheduledTask = channel.eventLoop.scheduleTask(in: .seconds(Int64(timeoutSeconds))) {
             logger.warning("Command timed out after \(timeoutSeconds) seconds")
             resultPromise.fail(IMAPError.timeout)
         }
@@ -743,7 +768,7 @@ final class IMAPConnection {
         let handler = HandlerType.init(commandTag: "", promise: resultPromise)
 
         let logger = self.logger
-        let scheduledTask = group.next().scheduleTask(in: .seconds(Int64(timeoutSeconds))) {
+        let scheduledTask = channel.eventLoop.scheduleTask(in: .seconds(Int64(timeoutSeconds))) {
             logger.warning("Handler execution timed out after \(timeoutSeconds) seconds")
             resultPromise.fail(IMAPError.timeout)
         }

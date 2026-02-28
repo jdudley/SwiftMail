@@ -85,6 +85,49 @@ struct XOAUTH2AuthenticationHandlerTests {
         #expect(capabilities.isEmpty)
     }
 
+
+    @Test
+    func testSASLIRServerSendsEmptyChallengeRetriesCredentials() async throws {
+        let (channel, promise, _) = try await setUpChannel(tag: "A002A", expectsChallenge: false)
+        defer { _ = try? channel.finish() }
+
+        let command = TaggedCommand(
+            tag: "A002A",
+            command: .authenticate(
+                mechanism: AuthenticationMechanism("XOAUTH2"),
+                initialResponse: InitialResponse(makeCredentialBuffer(using: channel.allocator))
+            )
+        )
+
+        try await channel.writeAndFlush(IMAPClientHandler.OutboundIn.part(.tagged(command)))
+
+        guard var firstOutbound = try channel.readOutbound(as: ByteBuffer.self) else {
+            Issue.record("Expected AUTHENTICATE command")
+            return
+        }
+        let firstLine = firstOutbound.readString(length: firstOutbound.readableBytes)
+        let expectedBase64 = makeBase64String()
+        #expect(firstLine == "A002A AUTHENTICATE XOAUTH2 \(expectedBase64)\r\n")
+
+        var challengeBuffer = channel.allocator.buffer(capacity: 0)
+        challengeBuffer.writeString("+ \r\n")
+        try channel.writeInbound(challengeBuffer)
+
+        guard var continuation = try channel.readOutbound(as: ByteBuffer.self) else {
+            Issue.record("Expected XOAUTH2 continuation retry data")
+            return
+        }
+        let continuationLine = continuation.readString(length: continuation.readableBytes)
+        #expect(continuationLine == "\(expectedBase64)\r\n")
+
+        var okBuffer = channel.allocator.buffer(capacity: 0)
+        okBuffer.writeString("A002A OK AUTHENTICATE completed\r\n")
+        try channel.writeInbound(okBuffer)
+
+        let capabilities = try await promise.futureResult.get()
+        #expect(capabilities.isEmpty)
+    }
+
     @Test
     func testServerErrorBlobTriggersAuthFailure() async throws {
         let (channel, promise, _) = try await setUpChannel(tag: "A003", expectsChallenge: false)
@@ -158,6 +201,38 @@ struct XOAUTH2AuthenticationHandlerTests {
         } catch let error as IMAPError {
             if case .authFailed = error {
                 // expected path
+            } else {
+                Issue.record("Unexpected IMAPError: \(error)")
+            }
+        } catch {
+            Issue.record("Unexpected error type: \(error)")
+        }
+    }
+
+
+    @Test
+    func testChannelCloseFailsPendingAuthentication() async throws {
+        let (channel, promise, _) = try await setUpChannel(tag: "A005", expectsChallenge: false)
+
+        let command = TaggedCommand(
+            tag: "A005",
+            command: .authenticate(
+                mechanism: AuthenticationMechanism("XOAUTH2"),
+                initialResponse: InitialResponse(makeCredentialBuffer(using: channel.allocator))
+            )
+        )
+
+        try await channel.writeAndFlush(IMAPClientHandler.OutboundIn.part(.tagged(command)))
+        _ = try channel.readOutbound(as: ByteBuffer.self)
+
+        try await channel.close().get()
+
+        do {
+            _ = try await promise.futureResult.get()
+            Issue.record("Expected connection failure when channel closes")
+        } catch let error as IMAPError {
+            if case .connectionFailed(let message) = error {
+                #expect(message.contains("Connection closed before command completed"))
             } else {
                 Issue.record("Unexpected IMAPError: \(error)")
             }
