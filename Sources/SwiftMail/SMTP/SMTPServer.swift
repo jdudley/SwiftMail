@@ -68,6 +68,18 @@ public actor SMTPServer {
     
     /** Server capabilities reported by EHLO command */
     private var capabilities: [String] = []
+
+    public var capabilitiesSnapshot: [String] {
+        capabilities
+    }
+
+    public var supports8BitMIME: Bool {
+        capabilities.contains("8BITMIME")
+    }
+
+    public var maximumMessageSizeOctets: Int? {
+        Self.maximumMessageSizeOctets(from: capabilities)
+    }
     
     /** 
      Logger for SMTP operations
@@ -366,7 +378,7 @@ public actor SMTPServer {
        - Logs attachment details at debug level
        - Redacts sensitive content in logs
      */
-    public func sendEmail(_ email: Email) async throws {
+    public func sendEmail(_ email: Email, messageSizeOctets: Int? = nil) async throws {
         // Check if we have a valid channel (meaning we're connected)
         guard channel != nil else {
             logger.error("Attempting to send email without an active connection")
@@ -386,7 +398,8 @@ public actor SMTPServer {
         }
         
         // Check if the server supports 8BITMIME
-        let supports8BitMIME = self.capabilities.contains("8BITMIME")
+        let supports8BitMIME = self.supports8BitMIME
+        let announcedMessageSizeOctets = messageSizeOctets ?? email.messageSizeOctets(use8BitMIME: supports8BitMIME)
         
         if supports8BitMIME {
             self.logger.debug("Server supports 8BITMIME, using it for this email")
@@ -394,7 +407,11 @@ public actor SMTPServer {
         
         do {
             // Create Mail From command using 8BITMIME if supported
-            let mailFrom = try MailFromCommand(senderAddress: email.sender.address, use8BitMIME: supports8BitMIME)
+            let mailFrom = try MailFromCommand(
+                senderAddress: email.sender.address,
+                use8BitMIME: supports8BitMIME,
+                messageSizeOctets: announcedMessageSizeOctets
+            )
             _ = try await executeCommand(mailFrom)
             
             // RCPT TO commands
@@ -677,6 +694,16 @@ public actor SMTPServer {
         }
         
         return parsedCapabilities
+    }
+
+    static func maximumMessageSizeOctets(from capabilities: [String]) -> Int? {
+        for capability in capabilities {
+            guard capability.hasPrefix("SIZE ") else { continue }
+            let value = capability.dropFirst("SIZE ".count).trimmingCharacters(in: .whitespaces)
+            guard let octets = Int(value), octets > 0 else { continue }
+            return octets
+        }
+        return nil
     }
     
     /**
