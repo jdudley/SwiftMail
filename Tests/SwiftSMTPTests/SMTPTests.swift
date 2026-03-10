@@ -209,4 +209,48 @@ struct SMTPTests {
             )
         }
     }
+
+    @Test
+    func testConstructContentUsesProvidedMessageIDHeaderExactlyOnce() {
+        var email = Email(
+            sender: EmailAddress(address: "sender@example.com"),
+            recipients: [EmailAddress(address: "recipient@example.com")],
+            subject: "Hello",
+            textBody: "Body"
+        )
+        email.additionalHeaders = [
+            "Message-ID": "<provided@example.com>",
+            "X-Test-Header": "present"
+        ]
+
+        let content = email.constructContent()
+        let messageIDHeaders = content
+            .components(separatedBy: "\r\n")
+            .filter { $0.lowercased().hasPrefix("message-id:") }
+
+        #expect(messageIDHeaders.count == 1)
+        #expect(messageIDHeaders.first == "Message-Id: <provided@example.com>")
+        #expect(content.contains("X-Test-Header: present"))
+    }
+
+    @Test
+    func testConstructContentTreatsMessageIDHeaderCaseInsensitively() {
+        var email = Email(
+            sender: EmailAddress(address: "sender@example.com"),
+            recipients: [EmailAddress(address: "recipient@example.com")],
+            subject: "Hello",
+            textBody: "Body"
+        )
+        email.additionalHeaders = [
+            "message-id": "<lowercase@example.com>"
+        ]
+
+        let content = email.constructContent()
+        let messageIDHeaders = content
+            .components(separatedBy: "\r\n")
+            .filter { $0.lowercased().hasPrefix("message-id:") }
+
+        #expect(messageIDHeaders.count == 1)
+        #expect(messageIDHeaders.first == "Message-Id: <lowercase@example.com>")
+    }
 }
