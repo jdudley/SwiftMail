@@ -58,7 +58,7 @@ final class CopyHandler: BaseIMAPCommandHandler<CopyUID?>, IMAPCommandHandler, @
         do {
             succeedWithResult(try extractCopyUID(from: response))
         } catch {
-            failWithError(error)
+            failWithError(IMAPError.malformedCopyUIDAfterTaggedOK(String(describing: error)))
         }
     }
 

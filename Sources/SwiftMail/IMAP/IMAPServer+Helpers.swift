@@ -19,6 +19,7 @@ extension IMAPServer {
         return try await primaryConnection.executeCommand(command)
     }
 
+    /// Refreshes session-scoped state before a capability-dependent command decision.
     func ensurePrimaryConnectionAuthenticated() async throws {
         if let authentication, !primaryConnection.isAuthenticated {
             logger.info("Primary connection not authenticated; re-authenticating before command")

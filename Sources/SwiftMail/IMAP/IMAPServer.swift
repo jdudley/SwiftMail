@@ -93,7 +93,16 @@ public actor IMAPServer {
 
     /// Whether the primary connection advertised UIDPLUS.
     public var supportsUIDPlus: Bool {
-        capabilities.contains(.uidPlus)
+        capabilities.containsUIDPlusCapability
+    }
+
+    /// Whether the primary connection advertised MOVE (RFC 6851).
+    ///
+    /// This reports the advertised capability only. The default
+    /// ``move(messages:to:fallback:)`` policy retains the existing UIDPLUS-dependent fallback,
+    /// while ``MoveFallbackPolicy/disabled`` requires MOVE directly.
+    public var supportsMove: Bool {
+        capabilities.containsMoveCapability
     }
 
     var certificatePolicyForTesting: MailCertificateVerificationPolicy {

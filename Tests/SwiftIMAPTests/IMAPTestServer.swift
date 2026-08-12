@@ -44,11 +44,15 @@ final class IMAPTestServer {
     private var acceptSource: DispatchSourceRead?
     private let queue = DispatchQueue(label: "IMAPTestServer")
     private let messages: [Message]
+    private let advertisedCapabilities: [String]
     private let loginResponseDelay: TimeInterval
+    private let rejectedUIDSubcommand: String?
+    private let copyUIDSourceOverride: String?
     private let personalNamespacePrefix: String
     private let namespaceDelimiter: Character
     private let metricsQueue = DispatchQueue(label: "IMAPTestServer.metrics")
     private var idleCommandCountStorage = 0
+    private var commandLogStorage: [String] = []
     private var clientFds: Set<Int32> = []
     private let clientFdsLock = NSLock()
     private let clientGroup = DispatchGroup()
@@ -60,6 +64,11 @@ final class IMAPTestServer {
         username: String = "testuser",
         password: String = "testpass",
         loginResponseDelay: TimeInterval = 0,
+        rejectedUIDSubcommand: String? = nil,
+        copyUIDSourceOverride: String? = nil,
+        advertisedCapabilities: [String] = [
+            "IMAP4rev1", "AUTH=PLAIN", "LITERAL+", "ID", "NAMESPACE", "UIDPLUS", "IDLE"
+        ],
         personalNamespacePrefix: String = "",
         namespaceDelimiter: Character = "/",
         maildirURL: URL
@@ -69,6 +78,9 @@ final class IMAPTestServer {
         self.username = username
         self.password = password
         self.loginResponseDelay = loginResponseDelay
+        self.rejectedUIDSubcommand = rejectedUIDSubcommand?.uppercased()
+        self.copyUIDSourceOverride = copyUIDSourceOverride
+        self.advertisedCapabilities = advertisedCapabilities
         self.personalNamespacePrefix = personalNamespacePrefix
         self.namespaceDelimiter = namespaceDelimiter
         self.messages = try Self.loadMaildir(maildirURL)
@@ -76,6 +88,10 @@ final class IMAPTestServer {
 
     var idleCommandCount: Int {
         metricsQueue.sync { idleCommandCountStorage }
+    }
+
+    var commandLog: [String] {
+        metricsQueue.sync { commandLogStorage }
     }
 
     private func recordIdleCommand() {
@@ -92,6 +108,10 @@ final class IMAPTestServer {
 
     private func recordIDCommand() {
         metricsQueue.sync { idCommandCountStorage += 1 }
+    }
+
+    private func recordCommand(_ line: String) {
+        metricsQueue.sync { commandLogStorage.append(line) }
     }
 
     var lastExaminedMailbox: String? {
@@ -317,6 +337,7 @@ final class IMAPTestServer {
                 let tag = parts[0]
                 let command = parts[1].uppercased()
                 let args = parts.count > 2 ? parts[2] : ""
+                recordCommand(line)
 
                 if command == "IDLE" {
                     recordIdleCommand()
@@ -408,7 +429,7 @@ final class IMAPTestServer {
     ) -> String {
         switch command {
             case "CAPABILITY":
-                return "* CAPABILITY IMAP4rev1 AUTH=PLAIN LITERAL+ ID NAMESPACE UIDPLUS IDLE\r\n"
+                return "* CAPABILITY \(advertisedCapabilities.joined(separator: " "))\r\n"
                     + "\(tag) OK CAPABILITY completed\r\n"
             case "LOGIN":
                 if loginResponseDelay > 0 {
@@ -458,6 +479,8 @@ final class IMAPTestServer {
                 return "* ID NIL\r\n\(tag) OK ID completed\r\n"
             case "NOOP":
                 return "\(tag) OK NOOP completed\r\n"
+            case "EXPUNGE":
+                return "\(tag) OK EXPUNGE completed\r\n"
             case "LOGOUT":
                 return "* BYE IMAP server shutting down\r\n\(tag) OK LOGOUT completed\r\n"
             default:
@@ -471,14 +494,48 @@ final class IMAPTestServer {
             return "\(tag) BAD Missing UID subcommand\r\n"
         }
         let subargs = parts.count > 1 ? parts[1] : ""
+        if subcmd == rejectedUIDSubcommand {
+            return "\(tag) NO Injected UID \(subcmd) failure\r\n"
+        }
         switch subcmd {
             case "FETCH":
                 return handleFetch(tag: tag, args: subargs, uidMode: true)
             case "SEARCH":
                 let uids = messages.map { String($0.uid) }.joined(separator: " ")
                 return "* SEARCH \(uids)\r\n\(tag) OK UID SEARCH completed\r\n"
+            case "MOVE":
+                guard advertisesCapability("MOVE") else {
+                    return "\(tag) BAD UID MOVE not supported\r\n"
+                }
+                let moveParts = subargs.split(separator: " ", maxSplits: 1).map(String.init)
+                guard moveParts.count == 2 else { return "\(tag) BAD Invalid UID MOVE\r\n" }
+                if advertisesCapability("UIDPLUS") {
+                    let sourceUIDs = copyUIDSourceOverride ?? moveParts[0]
+                    return "\(tag) OK [COPYUID 2 \(sourceUIDs) 101] UID MOVE completed\r\n"
+                }
+                return "\(tag) OK UID MOVE completed\r\n"
+            case "COPY":
+                let copyParts = subargs.split(separator: " ", maxSplits: 1).map(String.init)
+                guard copyParts.count == 2 else { return "\(tag) BAD Invalid UID COPY\r\n" }
+                if advertisesCapability("UIDPLUS") {
+                    let sourceUIDs = copyUIDSourceOverride ?? copyParts[0]
+                    return "\(tag) OK [COPYUID 2 \(sourceUIDs) 101] UID COPY completed\r\n"
+                }
+                return "\(tag) OK UID COPY completed\r\n"
+            case "STORE":
+                return "\(tag) OK UID STORE completed\r\n"
+            case "EXPUNGE":
+                return "\(tag) OK UID EXPUNGE completed\r\n"
             default:
                 return "\(tag) BAD Unknown UID subcommand\r\n"
+        }
+    }
+
+    private func advertisesCapability(_ expected: String) -> Bool {
+        advertisedCapabilities.contains { capability in
+            capability.utf8.elementsEqual(expected.lowercased().utf8) { candidate, expectedByte in
+                (candidate | 0x20) == expectedByte
+            }
         }
     }
 

@@ -6,7 +6,7 @@ import NIOEmbedded
 import Testing
 @testable import SwiftMail
 
-/// Tests for COPYUID extraction from UID COPY and UID MOVE tagged responses.
+/// Tests COPYUID extraction and malformed-evidence handling for UID COPY and UID MOVE.
 @Suite(.serialized, .timeLimit(.minutes(1)))
 struct CopyUIDTests {
 
@@ -85,9 +85,9 @@ struct CopyUIDTests {
     // MARK: - CopyHandler — cardinality mismatch
 
     @Test
-    func testCardinalityMismatchThrows() async throws {
+    func testCopyCardinalityMismatchOnTaggedOKThrowsTypedCompletionError() async {
         // Source has 2 UIDs, destination has 1 — malformed.
-        await #expect(throws: (any Error).self) {
+        await expectMalformedCopyUID {
             try await executeCopy(
                 responses: ["A001 OK [COPYUID 1 1:2 200] COPY completed\r\n"]
             )
@@ -116,6 +116,121 @@ struct CopyUIDTests {
             responses: ["A001 OK MOVE completed\r\n"]
         )
         #expect(result == nil)
+    }
+
+    @Test
+    func testMoveCardinalityMismatchOnTaggedOKThrowsTypedCompletionError() async {
+        await expectMalformedCopyUID {
+            try await executeMove(
+                responses: ["A001 OK [COPYUID 1 1:2 200] MOVE completed\r\n"]
+            )
+        }
+    }
+
+    @Test
+    func testMoveRetainsUntaggedOKCopyUIDAcrossExpungeResponses() async throws {
+        let result = try await executeMove(
+            responses: [
+                "* OK [COPYUID 10 3 300] Moved\r\n",
+                "* 1 EXPUNGE\r\n",
+                "* 2 EXPUNGE\r\n",
+                "A001 OK MOVE completed\r\n"
+            ]
+        )
+
+        let copyUID = try #require(result)
+        #expect(copyUID.destinationUIDValidity == UIDValidity(10))
+        #expect(copyUID.mapping.map(\.source.value) == [3])
+        #expect(copyUID.mapping.map(\.destination.value) == [300])
+    }
+
+    @Test
+    func testMoveAcceptsMatchingUntaggedAndTaggedCopyUID() async throws {
+        let result = try await executeMove(
+            responses: [
+                "* OK [COPYUID 10 3 300] Moved\r\n",
+                "A001 OK [COPYUID 10 3 300] MOVE completed\r\n"
+            ]
+        )
+
+        let copyUID = try #require(result)
+        #expect(copyUID.mapping.map(\.destination.value) == [300])
+    }
+
+    @Test
+    func testMoveRejectsConflictingUntaggedAndTaggedCopyUID() async {
+        await expectMalformedCopyUID {
+            try await executeMove(
+                responses: [
+                    "* OK [COPYUID 10 3 300] Moved\r\n",
+                    "A001 OK [COPYUID 10 3 301] MOVE completed\r\n"
+                ]
+            )
+        }
+    }
+
+    @Test
+    func testMoveMalformedUntaggedCopyUIDThrowsOnlyAfterTaggedOK() async {
+        await expectMalformedCopyUID {
+            try await executeMove(
+                responses: [
+                    "* OK [COPYUID 1 1:2 200] Moved\r\n",
+                    "* 1 EXPUNGE\r\n",
+                    "A001 OK MOVE completed\r\n"
+                ]
+            )
+        }
+    }
+
+    @Test
+    func testMoveTaggedFailureWinsOverMalformedUntaggedCopyUID() async {
+        do {
+            _ = try await executeMove(
+                responses: [
+                    "* OK [COPYUID 1 1:2 200] Moved\r\n",
+                    "A001 NO MOVE denied\r\n"
+                ]
+            )
+            Issue.record("Expected tagged NO to report possible partial completion")
+        } catch let error as IMAPError {
+            guard case .moveFailedAfterPossiblePartialCompletion = error else {
+                Issue.record("Expected possible partial completion, got \(error)")
+                return
+            }
+        } catch {
+            Issue.record("Expected possible-partial IMAPError, got \(error)")
+        }
+    }
+
+    @Test
+    func testMoveTaggedNOReportsPossiblePartialCompletion() async {
+        do {
+            _ = try await executeMove(responses: ["A001 NO MOVE denied\r\n"])
+            Issue.record("Expected possible partial completion")
+        } catch let error as IMAPError {
+            guard case .moveFailedAfterPossiblePartialCompletion = error else {
+                Issue.record("Expected possible partial completion, got \(error)")
+                return
+            }
+            #expect(error.recoverySuggestion?.contains("Do not retry") == true)
+        } catch {
+            Issue.record("Expected possible-partial IMAPError, got \(error)")
+        }
+    }
+
+    @Test
+    func testCopyTaggedNOThrowsCopyFailed() async {
+        do {
+            _ = try await executeCopy(responses: ["A001 NO COPY denied\r\n"])
+            Issue.record("Expected tagged NO to throw copyFailed")
+        } catch let error as IMAPError {
+            guard case .copyFailed = error else {
+                Issue.record("Expected copyFailed, got \(error)")
+                return
+            }
+        } catch {
+            Issue.record("Expected IMAPError.copyFailed, got \(error)")
+        }
     }
 
     // MARK: - CopyUID model — maximum uidValidity
@@ -172,5 +287,106 @@ struct CopyUIDTests {
         }
 
         return try await promise.futureResult.get()
+    }
+
+    private func expectMalformedCopyUID(
+        _ operation: () async throws -> CopyUID?
+    ) async {
+        do {
+            _ = try await operation()
+            Issue.record("Expected malformedCopyUIDAfterTaggedOK")
+        } catch let error as IMAPError {
+            guard case .malformedCopyUIDAfterTaggedOK = error else {
+                Issue.record("Expected malformedCopyUIDAfterTaggedOK, got \(error)")
+                return
+            }
+        } catch {
+            Issue.record("Expected IMAPError.malformedCopyUIDAfterTaggedOK, got \(error)")
+        }
+    }
+}
+
+extension CopyUIDTests {
+    @Test(
+        "COPY and MOVE reject wildcard COPYUID members",
+        arguments: [
+            "A001 OK [COPYUID 42 * 101] completed\r\n",
+            "A001 OK [COPYUID 42 1 *] completed\r\n",
+            "A001 OK [COPYUID 42 1:* 101:102] completed\r\n"
+        ]
+    )
+    func testWildcardCopyUIDMembersAreRejected(_ response: String) async {
+        await expectMalformedCopyUID {
+            try await executeCopy(responses: [response])
+        }
+        await expectMalformedCopyUID {
+            try await executeMove(responses: [response])
+        }
+    }
+
+    @Test
+    func testNormalizedNumericMaximumIsConservativelyRejected() async {
+        let response = "A001 OK [COPYUID 42 4294967295 101] completed\r\n"
+        await expectMalformedCopyUID {
+            try await executeCopy(responses: [response])
+        }
+        await expectMalformedCopyUID {
+            try await executeMove(responses: [response])
+        }
+    }
+
+    @Test(
+        "COPY and MOVE reject repeated COPYUID members",
+        arguments: [
+            "A001 OK [COPYUID 42 1,1 101,102] completed\r\n",
+            "A001 OK [COPYUID 42 1:2,2 101:103] completed\r\n",
+            "A001 OK [COPYUID 42 1,2 101,101] completed\r\n",
+            "A001 OK [COPYUID 42 1:3 101:102,102] completed\r\n"
+        ]
+    )
+    func testRepeatedCopyUIDMembersAreRejected(_ response: String) async {
+        await expectMalformedCopyUID {
+            try await executeCopy(responses: [response])
+        }
+        await expectMalformedCopyUID {
+            try await executeMove(responses: [response])
+        }
+    }
+
+    @Test
+    func testMoveTaggedFailurePreservesVerifiedPartialMapping() async {
+        do {
+            _ = try await executeMove(
+                responses: [
+                    "* OK [COPYUID 10 3:4 300:301] Partially moved\r\n",
+                    "A001 NO MOVE failed after partial completion\r\n"
+                ]
+            )
+            Issue.record("Expected moveFailedAfterPartialCompletion")
+        } catch let error as IMAPError {
+            guard case .moveFailedAfterPartialCompletion(let copyUID, let reason) = error else {
+                Issue.record("Expected moveFailedAfterPartialCompletion, got \(error)")
+                return
+            }
+            #expect(copyUID.destinationUIDValidity == UIDValidity(10))
+            #expect(copyUID.mapping.map(\.source.value) == [3, 4])
+            #expect(copyUID.mapping.map(\.destination.value) == [300, 301])
+            #expect(reason.contains("MOVE failed after partial completion"))
+            #expect(error.recoverySuggestion?.contains("Do not retry blindly") == true)
+        } catch {
+            Issue.record("Expected IMAPError.moveFailedAfterPartialCompletion, got \(error)")
+        }
+    }
+
+    @Test
+    func testMalformedCopyUIDRecoveryDoesNotSuggestRetry() {
+        let error = IMAPError.malformedCopyUIDAfterTaggedOK("duplicate source UID")
+        #expect(error.recoverySuggestion?.contains("Do not retry") == true)
+    }
+
+    @Test
+    func testLegacyMoveFailureRecoveryDoesNotSuggestRetry() {
+        let error = IMAPError.moveFailed("server rejected MOVE")
+        #expect(error.recoverySuggestion?.contains("Do not retry") == true)
     }
 }

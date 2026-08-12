@@ -58,7 +58,16 @@ public actor IMAPNamedConnection {
 
     /// Whether the server advertised UIDPLUS for this connection.
     public var supportsUIDPlus: Bool {
-        capabilities.contains(.uidPlus)
+        capabilities.containsUIDPlusCapability
+    }
+
+    /// Whether the server advertised MOVE (RFC 6851) for this connection.
+    ///
+    /// This reports the advertised capability only. The default
+    /// ``move(messages:to:fallback:)`` policy retains the existing UIDPLUS-dependent fallback,
+    /// while ``MoveFallbackPolicy/disabled`` requires MOVE directly.
+    public var supportsMove: Bool {
+        capabilities.containsMoveCapability
     }
 
     // MARK: - Internal Helpers
