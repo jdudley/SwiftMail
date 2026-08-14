@@ -13,10 +13,85 @@ enum SMTPTestError: Error {
     case setup(String)
 }
 
+final class SMTPTestReplyGate: @unchecked Sendable {
+    private let semaphore = DispatchSemaphore(value: 0)
+
+    func open() {
+        semaphore.signal()
+    }
+
+    func wait() {
+        let result = semaphore.wait(timeout: .now() + 5)
+        precondition(result == .success, "SMTP fake-server reply gate timed out before the test opened it")
+    }
+}
+
+/// Pauses the fake server exactly once after it has buffered the configured
+/// minimum amount of DATA content. Tests use this to apply deterministic
+/// backpressure before another public operation or cancellation is attempted.
+final class SMTPTestContentReadGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private let semaphore = DispatchSemaphore(value: 0)
+    private let minimumBytesBeforePause: Int
+    private var didPause = false
+    private var isOpen = false
+    private var pauseWaiters: [CheckedContinuation<Void, Never>] = []
+
+    init(minimumBytesBeforePause: Int = 0) {
+        precondition(minimumBytesBeforePause >= 0, "Content-read pause threshold cannot be negative")
+        self.minimumBytesBeforePause = minimumBytesBeforePause
+    }
+
+    func waitUntilPaused() async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            lock.lock()
+            if didPause {
+                lock.unlock()
+                continuation.resume()
+                return
+            }
+            pauseWaiters.append(continuation)
+            lock.unlock()
+        }
+    }
+
+    func open() {
+        lock.lock()
+        isOpen = true
+        lock.unlock()
+        semaphore.signal()
+    }
+
+    func pauseOnce(receivedByteCount: Int) {
+        lock.lock()
+        guard !didPause, receivedByteCount >= minimumBytesBeforePause else {
+            lock.unlock()
+            return
+        }
+        didPause = true
+        let waiters = pauseWaiters
+        pauseWaiters.removeAll()
+        let shouldWait = !isOpen
+        lock.unlock()
+
+        for waiter in waiters {
+            waiter.resume()
+        }
+        if shouldWait {
+            let result = semaphore.wait(timeout: .now() + 5)
+            precondition(result == .success, "SMTP content-read gate timed out before the test opened it")
+        }
+    }
+}
+
 /// What the scripted server does when it has to answer a client command.
 enum SMTPScriptAction {
     /// Send the reply line (CRLF appended) and keep the connection open.
     case reply(String)
+    /// Wait, then send the reply line (CRLF appended).
+    case delayedReply(String, delay: TimeInterval)
+    /// Keep reading the connection, but defer this reply until the test opens the gate.
+    case gatedReply(String, gate: SMTPTestReplyGate)
     /// Send the reply line, then immediately close the connection.
     case replyThenClose(String)
     /// Close the connection without sending any reply.
@@ -33,6 +108,9 @@ struct SMTPServerScript {
     var onRcptTo: [SMTPScriptAction] = [.reply("250 OK")]
     var onData: [SMTPScriptAction] = [.reply("354 End data with <CRLF>.<CRLF>")]
     var onContent: [SMTPScriptAction] = [.reply("250 2.0.0 OK queued as TEST42")]
+    var contentReadGate: SMTPTestContentReadGate?
+    var contentReadDelay: TimeInterval = 0
+    var receiveBufferBytes: Int32?
 }
 
 /// A minimal scripted SMTP server implemented with POSIX sockets.
@@ -309,29 +387,68 @@ final class SMTPTestServer {
     private func handleClient(fd fileDescriptor: Int32) {
         defer { closeTrackedClient(fd: fileDescriptor) }
 
+        if var receiveBufferBytes = script.receiveBufferBytes {
+            setsockopt(
+                fileDescriptor,
+                SOL_SOCKET,
+                SO_RCVBUF,
+                &receiveBufferBytes,
+                socklen_t(MemoryLayout<Int32>.size)
+            )
+        }
+
         sendLine(fd: fileDescriptor, "220 smtp.test ESMTP SMTPTestServer ready\r\n")
 
         var buffer = Data()
         var inDataMode = false
+        let contentTerminator = Data("\r\n.\r\n".utf8)
+        var contentTerminatorSearchOffset = 0
         let readBuf = UnsafeMutablePointer<UInt8>.allocate(capacity: 65536)
         defer { readBuf.deallocate() }
 
         while true {
+            if inDataMode {
+                script.contentReadGate?.pauseOnce(receivedByteCount: buffer.count)
+            }
+            if inDataMode && script.contentReadDelay > 0 {
+                Thread.sleep(forTimeInterval: script.contentReadDelay)
+            }
             let bytesRead = read(fileDescriptor, readBuf, 65536)
             if bytesRead <= 0 { break }
             buffer.append(readBuf, count: bytesRead)
 
             while true {
                 if inDataMode {
-                    guard let terminatorRange = buffer.range(of: Data("\r\n.\r\n".utf8)) else { break }
+                    let searchStartOffset = min(contentTerminatorSearchOffset, buffer.count)
+                    let searchStart = buffer.index(buffer.startIndex, offsetBy: searchStartOffset)
+                    guard let terminatorRange = buffer.range(
+                        of: contentTerminator,
+                        options: [],
+                        in: searchStart..<buffer.endIndex
+                    ) else {
+                        // Only the last four bytes can begin a five-byte
+                        // terminator completed by the next socket read. Avoid
+                        // rescanning the entire growing message on every read.
+                        contentTerminatorSearchOffset = max(0, buffer.count - (contentTerminator.count - 1))
+                        break
+                    }
                     let content = Data(buffer[buffer.startIndex..<terminatorRange.lowerBound])
                     buffer = Data(buffer[terminatorRange.upperBound...])
                     inDataMode = false
+                    contentTerminatorSearchOffset = 0
                     recordContent(content)
 
                     switch nextContentAction() {
                         case .reply(let line):
                             sendLine(fd: fileDescriptor, line + "\r\n")
+                        case .delayedReply(let line, let delay):
+                            Thread.sleep(forTimeInterval: delay)
+                            sendLine(fd: fileDescriptor, line + "\r\n")
+                        case .gatedReply(let line, let gate):
+                            DispatchQueue.global().async { [weak self] in
+                                gate.wait()
+                                self?.sendLine(fd: fileDescriptor, line + "\r\n")
+                            }
                         case .replyThenClose(let line):
                             sendLine(fd: fileDescriptor, line + "\r\n")
                             return
@@ -348,6 +465,9 @@ final class SMTPTestServer {
 
                     switch handleCommandLine(line, fd: fileDescriptor, inDataMode: &inDataMode) {
                         case .keepGoing:
+                            if inDataMode {
+                                contentTerminatorSearchOffset = 0
+                            }
                             continue
                         case .closeConnection:
                             return
@@ -384,6 +504,11 @@ final class SMTPTestServer {
             return apply(nextMailFromAction(), fd: fileDescriptor)
         }
 
+        if upper.hasPrefix("AUTH PLAIN") {
+            sendLine(fd: fileDescriptor, "235 2.7.0 Authentication successful\r\n")
+            return .keepGoing
+        }
+
         if upper.hasPrefix("RCPT TO") {
             return apply(nextRcptToAction(), fd: fileDescriptor)
         }
@@ -414,6 +539,16 @@ final class SMTPTestServer {
         switch action {
             case .reply(let line):
                 sendLine(fd: fileDescriptor, line + "\r\n")
+                return .keepGoing
+            case .delayedReply(let line, let delay):
+                Thread.sleep(forTimeInterval: delay)
+                sendLine(fd: fileDescriptor, line + "\r\n")
+                return .keepGoing
+            case .gatedReply(let line, let gate):
+                DispatchQueue.global().async { [weak self] in
+                    gate.wait()
+                    self?.sendLine(fd: fileDescriptor, line + "\r\n")
+                }
                 return .keepGoing
             case .replyThenClose(let line):
                 sendLine(fd: fileDescriptor, line + "\r\n")

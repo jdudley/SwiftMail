@@ -40,13 +40,12 @@ public struct SMTPSendError: Error, Sendable, Equatable {
         /// While sending `DATA` or awaiting the `354` go-ahead.
         case data
 
-        /// During the message-content step. Once any content byte has been
-        /// handed to the transport, failures in this phase are
-        /// ``SMTPSendError/Acceptance-swift.enum/ambiguous`` unless the server
-        /// sent an explicit final reply. The only pre-transmission failure in
-        /// this phase is a cancellation caught immediately before the first
-        /// content byte was written, which is provably
-        /// ``SMTPSendError/Acceptance-swift.enum/notAccepted``.
+        /// During the message-content step. Before the final end-of-data
+        /// terminator is handed to the transport, the server cannot accept the
+        /// message and failures are provably
+        /// ``SMTPSendError/Acceptance-swift.enum/notAccepted``. After the
+        /// terminator is handed off, failures are ambiguous unless the server
+        /// sent an explicit final reply.
         case content
     }
 
@@ -70,10 +69,25 @@ public struct SMTPSendError: Error, Sendable, Equatable {
         /// same message is pointless.
         case rejectedPermanently
 
-        /// The message content was handed to the transport but no clear final
-        /// reply was received. The server may have accepted and delivered the
-        /// message; automatically retrying risks sending a duplicate.
+        /// The final end-of-data terminator was handed to the transport but no
+        /// clear final reply was received. The server may have accepted and
+        /// delivered the message; automatically retrying risks a duplicate.
         case ambiguous
+    }
+
+    /// The submission operation whose timeout budget expired.
+    public enum TimeoutStage: Sendable, Equatable {
+        /// The client timed out while writing an SMTP command.
+        case commandWrite
+
+        /// The client timed out while awaiting an SMTP command reply.
+        case commandResponse
+
+        /// The client timed out while uploading one message-content buffer.
+        case contentUpload
+
+        /// The client timed out while awaiting the final reply after DATA.
+        case contentResponse
     }
 
     /// Why the submission failed.
@@ -85,7 +99,8 @@ public struct SMTPSendError: Error, Sendable, Equatable {
         /// The surrounding task was cancelled.
         case cancelled
 
-        /// No reply arrived within the command timeout.
+        /// One submission operation exceeded its timeout.
+        /// See ``SMTPSendError/timeoutStage`` for the stage, when known.
         case timedOut
 
         /// The connection closed (EOF or already-closed channel) before a
@@ -121,6 +136,11 @@ public struct SMTPSendError: Error, Sendable, Equatable {
     /// Why the submission failed.
     public let reason: Reason
 
+    /// The submission operation whose timeout budget expired. Set when
+    /// ``reason-swift.property`` is ``Reason-swift.enum/timedOut`` and the
+    /// timeout originated from SwiftMail's submission executor.
+    public let timeoutStage: TimeoutStage?
+
     /// The recipient whose `RCPT TO` was explicitly rejected. Set only when
     /// ``phase-swift.property`` is ``Phase-swift.enum/rcptTo`` and
     /// ``reason-swift.property`` carries a server reply.
@@ -135,7 +155,7 @@ public struct SMTPSendError: Error, Sendable, Equatable {
     }
 
     /// The retry policy implied by ``acceptance-swift.property`` — and, for
-    /// pre-content rejections, by the reply code (5xx is permanent).
+    /// proven non-acceptance replies, by the reply code (5xx is permanent).
     public var retryDisposition: RetryDisposition {
         switch acceptance {
             case .ambiguous:
@@ -158,12 +178,14 @@ public struct SMTPSendError: Error, Sendable, Equatable {
         phase: Phase,
         acceptance: Acceptance,
         reason: Reason,
-        rejectedRecipient: EmailAddress? = nil
+        rejectedRecipient: EmailAddress? = nil,
+        timeoutStage: TimeoutStage? = nil
     ) {
         self.phase = phase
         self.acceptance = acceptance
         self.reason = reason
         self.rejectedRecipient = rejectedRecipient
+        self.timeoutStage = timeoutStage
     }
 }
 
@@ -181,7 +203,18 @@ extension SMTPSendError: CustomStringConvertible {
             case .cancelled:
                 text += ": cancelled"
             case .timedOut:
-                text += ": timed out waiting for the server's reply"
+                switch timeoutStage {
+                    case .commandWrite:
+                        text += ": timed out writing the SMTP command"
+                    case .commandResponse:
+                        text += ": timed out waiting for the server's reply"
+                    case .contentUpload:
+                        text += ": timed out uploading message content"
+                    case .contentResponse:
+                        text += ": timed out waiting for the final server reply"
+                    case nil:
+                        text += ": timed out"
+                }
             case .connectionLost:
                 text += ": connection lost"
             case .transport(let diagnostic):
@@ -228,9 +261,11 @@ extension SMTPSendError.Acceptance: CustomStringConvertible {
 
 // MARK: - Internal classification
 
-/// Marker failure used by the submission executor's response timeout so the
-/// classifier can identify a timed-out dialogue without matching error strings.
-struct SMTPSubmissionTimeoutError: Error {}
+/// Marker failure used by the submission executor so the classifier can
+/// preserve which timeout budget expired without matching error strings.
+struct SMTPSubmissionTimeoutError: Error {
+    let stage: SMTPSendError.TimeoutStage
+}
 
 extension SMTPSendError.Reason {
     /// Derive the reason from an error surfaced by the submission dialogue.
@@ -259,9 +294,10 @@ extension SMTPSendError.Reason {
 }
 
 extension SMTPSendError {
-    /// Classify a failure that happened before any message byte was handed to
-    /// the transport. Acceptance is provably ``Acceptance-swift.enum/notAccepted``.
-    static func classifyingPreContent(
+    /// Classify a failure for which the server provably could not have accepted
+    /// the complete message. This includes all command phases before DATA and
+    /// content upload failures before the final end-of-data terminator.
+    static func classifyingProvenNonAcceptance(
         _ error: Error,
         phase: Phase,
         recipient: EmailAddress? = nil
@@ -279,16 +315,29 @@ extension SMTPSendError {
             phase: phase,
             acceptance: .notAccepted,
             reason: reason,
-            rejectedRecipient: rejectedRecipient
+            rejectedRecipient: rejectedRecipient,
+            timeoutStage: (error as? SMTPSubmissionTimeoutError)?.stage
         )
     }
 
-    /// Classify a failure that happened after message content was handed to
-    /// the transport. Only an explicit final 4xx/5xx reply proves the server
-    /// rejected the message; every other outcome is ``Acceptance-swift.enum/ambiguous``
+    /// Classify a content-phase failure according to whether the final SMTP
+    /// end-of-data terminator may have been handed to the transport.
+    static func classifyingContentFailure(
+        _ error: Error,
+        endOfDataMayHaveBeenDispatched: Bool
+    ) -> SMTPSendError {
+        if endOfDataMayHaveBeenDispatched {
+            return classifyingPostEndOfDataDispatch(error)
+        }
+        return classifyingProvenNonAcceptance(error, phase: .content)
+    }
+
+    /// Classify a failure that happened after the final end-of-data terminator
+    /// was handed to the transport. Only an explicit 4xx/5xx reply proves the
+    /// server rejected the message; every other outcome is ``Acceptance-swift.enum/ambiguous``
     /// because the terminating dot may have reached the server (NIO and TLS
     /// buffering make the opposite unprovable client-side).
-    static func classifyingPostContentDispatch(_ error: Error) -> SMTPSendError {
+    static func classifyingPostEndOfDataDispatch(_ error: Error) -> SMTPSendError {
         let reason = Reason(classifying: error)
         let acceptance: Acceptance
         if case .reply(let response) = reason {
@@ -305,6 +354,11 @@ extension SMTPSendError {
         } else {
             acceptance = .ambiguous
         }
-        return SMTPSendError(phase: .content, acceptance: acceptance, reason: reason)
+        return SMTPSendError(
+            phase: .content,
+            acceptance: acceptance,
+            reason: reason,
+            timeoutStage: (error as? SMTPSubmissionTimeoutError)?.stage
+        )
     }
 }

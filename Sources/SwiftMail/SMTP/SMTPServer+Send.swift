@@ -35,6 +35,8 @@ extension SMTPServer {
          failures and can follow normal retry policy.
        - `CancellationError` if the task is cancelled before the dialogue starts.
      - Note:
+       - All public operations on one ``SMTPServer`` are queued so commands,
+         authentication, connection changes, and submissions cannot interleave.
        - After an explicit server rejection the connection stays usable for
          another attempt. After a timeout, cancellation, connection loss, or
          any ambiguous outcome the connection is closed; call ``connect()``
@@ -43,6 +45,9 @@ extension SMTPServer {
      */
     @discardableResult
     public func sendEmail(_ email: Email) async throws -> SMTPSendResult {
+        let permit = try await operationGate.acquire()
+        defer { operationGate.release(permit) }
+
         // Check if we have a valid channel (meaning we're connected)
         guard channel != nil else {
             logger.error("Attempting to send email without an active connection")
@@ -83,7 +88,8 @@ extension SMTPServer {
         let result = try await performSubmission(
             mailFrom: mailFrom,
             recipients: allRecipients,
-            contentData: preparedEmail.contentData
+            contentData: preparedEmail.contentData,
+            holding: permit
         )
 
         self.logger.debug("Email sent successfully")
@@ -117,6 +123,9 @@ extension SMTPServer {
         from sender: EmailAddress,
         to recipients: [EmailAddress]
     ) async throws -> SMTPSendResult {
+        let permit = try await operationGate.acquire()
+        defer { operationGate.release(permit) }
+
         guard channel != nil else {
             throw SMTPError.connectionFailed("Not connected to SMTP server. Call connect() first.")
         }
@@ -141,7 +150,8 @@ extension SMTPServer {
         let result = try await performSubmission(
             mailFrom: mailFrom,
             recipients: recipients,
-            contentData: rawMessage
+            contentData: rawMessage,
+            holding: permit
         )
 
         logger.debug("Raw message sent successfully")
@@ -164,11 +174,14 @@ extension SMTPServer {
      */
     @discardableResult
     public func reset() async throws -> SMTPResponse {
+        let permit = try await operationGate.acquire()
+        defer { operationGate.release(permit) }
+
         guard channel != nil else {
             throw SMTPError.connectionFailed("Not connected to SMTP server. Call connect() first.")
         }
 
-        return try await executeCommand(RsetCommand())
+        return try await executeCommand(RsetCommand(), holding: permit)
     }
 
     // MARK: - Shared submission dialogue
@@ -182,7 +195,8 @@ extension SMTPServer {
     private func performSubmission(
         mailFrom: MailFromCommand,
         recipients: [EmailAddress],
-        contentData: Data
+        contentData: Data,
+        holding permit: SMTPOperationGate.Permit
     ) async throws -> SMTPSendResult {
         // Build every RCPT TO up front so address-validation failures surface
         // as plain SMTPError before any part of the dialogue is dispatched.
@@ -194,58 +208,106 @@ extension SMTPServer {
         try Task.checkCancellation()
 
         do {
-            _ = try await executeSubmissionCommand(mailFrom)
+            _ = try await executeSubmissionCommand(
+                mailFrom,
+                holding: permit,
+                writeTimeout: submissionTimeouts.mailFromResponse,
+                responseTimeout: submissionTimeouts.mailFromResponse
+            )
         } catch {
-            throw await abortSubmission(with: .classifyingPreContent(error, phase: .mailFrom))
+            throw await abortSubmission(
+                with: .classifyingProvenNonAcceptance(error, phase: .mailFrom),
+                holding: permit
+            )
         }
 
         // All-or-nothing recipient policy: the first rejection aborts the
         // transaction instead of continuing with a partial recipient set.
         for (command, recipient) in rcptCommands {
             do {
-                _ = try await executeSubmissionCommand(command)
+                _ = try await executeSubmissionCommand(
+                    command,
+                    holding: permit,
+                    writeTimeout: submissionTimeouts.recipientResponse,
+                    responseTimeout: submissionTimeouts.recipientResponse
+                )
             } catch {
                 throw await abortSubmission(
-                    with: .classifyingPreContent(error, phase: .rcptTo, recipient: recipient)
+                    with: .classifyingProvenNonAcceptance(error, phase: .rcptTo, recipient: recipient),
+                    holding: permit
                 )
             }
         }
 
         do {
-            _ = try await executeSubmissionCommand(DataCommand())
+            _ = try await executeSubmissionCommand(
+                DataCommand(),
+                holding: permit,
+                writeTimeout: submissionTimeouts.dataResponse,
+                responseTimeout: submissionTimeouts.dataResponse
+            )
         } catch {
-            throw await abortSubmission(with: .classifyingPreContent(error, phase: .data))
+            throw await abortSubmission(
+                with: .classifyingProvenNonAcceptance(error, phase: .data),
+                holding: permit
+            )
         }
 
+        return try await performContentSubmission(contentData, holding: permit)
+    }
+
+    private func performContentSubmission(
+        _ contentData: Data,
+        holding permit: SMTPOperationGate.Permit
+    ) async throws -> SMTPSendResult {
         // Last provably-safe abort point: no message byte has been handed to
         // the transport yet, so a cancellation here cannot cause a delivery.
         if Task.isCancelled {
-            throw await abortSubmission(with: .classifyingPreContent(CancellationError(), phase: .content))
+            throw await abortSubmission(
+                with: .classifyingProvenNonAcceptance(CancellationError(), phase: .content),
+                holding: permit
+            )
         }
 
+        let dispatchState = SMTPSubmissionContentDispatchState()
         do {
-            let response = try await executeSubmissionCommand(SendContentCommand(data: contentData))
+            let response = try await executeSubmissionCommand(
+                SendContentCommand(data: contentData),
+                holding: permit,
+                writeTimeout: submissionTimeouts.contentUpload,
+                responseTimeout: submissionTimeouts.contentResponse,
+                writeTimeoutStage: .contentUpload,
+                responseTimeoutStage: .contentResponse,
+                contentDispatchState: dispatchState
+            )
             return SMTPSendResult(response: response)
         } catch {
-            throw await abortSubmission(with: .classifyingPostContentDispatch(error))
+            let sendError = SMTPSendError.classifyingContentFailure(
+                error,
+                endOfDataMayHaveBeenDispatched: dispatchState.endOfDataMayHaveBeenDispatched
+            )
+            throw await abortSubmission(with: sendError, holding: permit)
         }
     }
 
     /// Run the cleanup appropriate for a classified submission failure and
     /// return the error for the caller to throw.
     ///
-    /// - An explicit pre-content rejection leaves the dialogue in sync: abort
+    /// - An explicit rejection before the content terminator leaves the dialogue in sync: abort
     ///   the open transaction with a best-effort `RSET` (RFC 5321 §4.3.1
     ///   requires concluding a transaction before starting another) so the
     ///   connection stays reusable; close it if the reset fails.
-    /// - An explicit post-content rejection already concluded the transaction;
+    /// - An explicit final content rejection already concluded the transaction;
     ///   the session is back in command state and stays open.
     /// - A `421` reply announces the server is closing the channel: close ours.
     /// - Everything else (timeout, cancellation, connection loss, transport
     ///   errors) leaves the dialogue state unknown — possibly even DATA-input
     ///   mode, where an `RSET` would be swallowed as message text — so the
     ///   connection is closed.
-    private func abortSubmission(with sendError: SMTPSendError) async -> SMTPSendError {
+    private func abortSubmission(
+        with sendError: SMTPSendError,
+        holding permit: SMTPOperationGate.Permit
+    ) async -> SMTPSendError {
         logger.error("\(sendError.description)")
 
         // Any ambiguous outcome leaves the protocol state unknown. This also
@@ -253,24 +315,24 @@ extension SMTPServer {
         // even though a reply arrived, it did not prove that the server
         // accepted or rejected the completed message.
         if sendError.acceptance == .ambiguous {
-            await closeConnectionAfterFailedSubmission()
+            await closeConnectionAfterFailedSubmission(holding: permit)
             return sendError
         }
 
         switch sendError.reason {
             case .reply(let response) where response.code == 421:
-                await closeConnectionAfterFailedSubmission()
+                await closeConnectionAfterFailedSubmission(holding: permit)
             case .reply where sendError.phase == .content:
                 break
             case .reply:
                 do {
-                    _ = try await executeCommand(RsetCommand())
+                    _ = try await executeCommand(RsetCommand(), holding: permit)
                 } catch {
                     logger.warning("RSET after rejected transaction failed: \(error)")
-                    await closeConnectionAfterFailedSubmission()
+                    await closeConnectionAfterFailedSubmission(holding: permit)
                 }
             case .cancelled, .timedOut, .connectionLost, .transport:
-                await closeConnectionAfterFailedSubmission()
+                await closeConnectionAfterFailedSubmission(holding: permit)
         }
 
         return sendError
@@ -278,7 +340,10 @@ extension SMTPServer {
 
     /// Close and clear the channel after a submission failure that leaves the
     /// session unusable. A later ``connect()`` starts a fresh session.
-    private func closeConnectionAfterFailedSubmission() async {
+    private func closeConnectionAfterFailedSubmission(
+        holding permit: SMTPOperationGate.Permit
+    ) async {
+        precondition(operationGate.isHeld(permit), "SMTP channel closed without owning it")
         guard let channel = self.channel else {
             return
         }
@@ -291,63 +356,6 @@ extension SMTPServer {
             try await channel.close().get()
         } catch {
             logger.debug("Channel close after failed submission reported: \(error)")
-        }
-    }
-
-    /// Execute one command of the submission dialogue.
-    ///
-    /// Differs from ``executeCommand(_:)`` in three ways that the outcome
-    /// classification depends on:
-    /// - errors are rethrown untouched (no re-wrapping into
-    ///   `SMTPError.connectionFailed`), so the classifier sees original types;
-    /// - the response timeout fails with the internal marker
-    ///   `SMTPSubmissionTimeoutError` instead of a string-only error;
-    /// - awaiting the reply is cancellation-aware: `EventLoopFuture.get()`
-    ///   ignores task cancellation, so without this a task cancelled after the
-    ///   content terminator would silently keep waiting and could even return
-    ///   success. Cancellation fails the pending promise immediately; the
-    ///   caller then classifies the outcome and closes the connection.
-    private func executeSubmissionCommand<CommandType: SMTPCommand>(
-        _ command: CommandType
-    ) async throws -> CommandType.ResultType {
-        guard let channel = channel else {
-            throw SMTPError.connectionFailed("Not connected to SMTP server")
-        }
-
-        try command.validate()
-
-        let resultPromise = channel.eventLoop.makePromise(of: CommandType.ResultType.self)
-        let commandTag = UUID().uuidString
-        let commandData = command.toCommandData()
-        let handler = command.makeHandler(commandTag: commandTag, promise: resultPromise)
-
-        let timeoutSeconds = submissionTimeoutSecondsForTesting ?? command.timeoutSeconds
-        let scheduledTask = channel.eventLoop.scheduleTask(in: .seconds(Int64(timeoutSeconds))) {
-            resultPromise.fail(SMTPSubmissionTimeoutError())
-        }
-        defer { scheduledTask.cancel() }
-
-        do {
-            try await channel.pipeline.addHandler(handler).get()
-
-            // Send the command to the server as raw bytes + CRLF
-            var buffer = channel.allocator.buffer(capacity: commandData.count + 2)
-            buffer.writeBytes(commandData)
-            buffer.writeBytes([0x0D, 0x0A]) // CRLF
-            try await channel.writeAndFlush(buffer).get()
-
-            let result = try await withTaskCancellationHandler {
-                try await resultPromise.futureResult.get()
-            } onCancel: {
-                resultPromise.fail(CancellationError())
-            }
-            duplexLogger.flushInboundBuffer()
-            return result
-        } catch {
-            // Ensure the promise is resolved to prevent NIO "leaking promise" fatal error
-            resultPromise.fail(error)
-            duplexLogger.flushInboundBuffer()
-            throw error
         }
     }
 
