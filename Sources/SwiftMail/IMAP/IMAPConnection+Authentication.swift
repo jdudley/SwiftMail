@@ -33,11 +33,8 @@ extension IMAPConnection {
         let mechanism = AuthenticationMechanism("PLAIN")
         let plainCapability = Capability.authenticate(mechanism)
 
-        guard capabilities.contains(plainCapability) else {
-            throw IMAPError.unsupportedAuthMechanism("PLAIN not advertised by server")
-        }
-
         let channel = try await prepareAuthenticationChannel(operation: "PLAIN authenticate")
+        try await requireAdvertisedAuthenticationMechanism(plainCapability, name: "PLAIN")
         let tag = generateCommandTag()
 
         let handlerPromise = channel.eventLoop.makePromise(of: [Capability].self)
@@ -146,6 +143,26 @@ extension IMAPConnection {
         try await channel.writeAndFlush(wrapped)
     }
 
+    /// Judges the mechanism against a live capability snapshot.
+    ///
+    /// Must run after `prepareAuthenticationChannel`: a disconnect (explicit,
+    /// or a recycle after a timeout or buffered BYE) clears the snapshot along
+    /// with the channel, and the reconnect refreshes it. Checking the stale
+    /// empty set first turned every re-authentication on a dropped connection
+    /// into "not advertised by server" without ever contacting the server. When
+    /// the snapshot is empty on a live channel, ask the server before deciding.
+    private func requireAdvertisedAuthenticationMechanism(
+        _ capability: Capability,
+        name: String
+    ) async throws {
+        if capabilities.isEmpty {
+            try await refreshCapabilities(using: [], useCommandBody: true)
+        }
+        guard capabilities.contains(capability) else {
+            throw IMAPError.unsupportedAuthMechanism("\(name) not advertised by server")
+        }
+    }
+
     private func prepareAuthenticationChannel(operation: String) async throws -> Channel {
         try await waitForIdleCompletionIfNeeded()
         try await recycleConnectionIfBufferedTerminationIfNeeded(operation: operation)
@@ -211,11 +228,8 @@ extension IMAPConnection {
         let mechanism = AuthenticationMechanism("XOAUTH2")
         let xoauthCapability = Capability.authenticate(mechanism)
 
-        guard capabilities.contains(xoauthCapability) else {
-            throw IMAPError.unsupportedAuthMechanism("XOAUTH2 not advertised by server")
-        }
-
         let channel = try await prepareAuthenticationChannel(operation: "XOAUTH2 authenticate")
+        try await requireAdvertisedAuthenticationMechanism(xoauthCapability, name: "XOAUTH2")
         let tag = generateCommandTag()
 
         let handlerPromise = channel.eventLoop.makePromise(of: [Capability].self)
