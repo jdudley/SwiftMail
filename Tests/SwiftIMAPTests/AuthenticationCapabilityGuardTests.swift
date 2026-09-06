@@ -104,6 +104,45 @@ struct AuthenticationCapabilityGuardTests {
         }
     }
 
+    /// The empty-snapshot refresh runs through `executeCommandBody`, which recycles a
+    /// buffered BYE or reconnects a dead transport. Authentication must then use the
+    /// replacement, not the channel captured before the refresh: writing on the stale
+    /// one failed, and that failure's `disconnectBody()` closed the healthy replacement
+    /// too (review on #221).
+    @Test
+    func refreshThatReplacedTheChannelAuthenticatesOnTheReplacement() async throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        defer { try? group.syncShutdownGracefully() }
+        let stale = try await makeLiveHarness(group: group, capabilities: [])
+        let connection = stale.connection
+        let replacementChannel = NIOAsyncTestingChannel()
+        connection.replaceCapabilityRefreshForTesting {
+            // The transport died under the refresh; the connection reconnected and
+            // took its capabilities from the new channel.
+            try await stale.channel.close()
+            try await replacementChannel.connect(to: SocketAddress(ipAddress: "127.0.0.1", port: 143))
+            try await replacementChannel.addIMAPClientHandler()
+            try await replacementChannel.pipeline.addHandler(connection.duplexLogger)
+            try await replacementChannel.pipeline.addHandler(connection.responseBuffer)
+            connection.replaceChannelForTesting(replacementChannel)
+            connection.replaceCapabilitiesForTesting([
+                Capability("IMAP4rev1"),
+                Capability("SASL-IR"),
+                .authenticate(AuthenticationMechanism("PLAIN"))
+            ])
+        }
+        let replacement = Harness(connection: connection, channel: replacementChannel)
+        let authTask = Task {
+            try await connection.authenticatePlain(username: "user", password: "secret")
+        }
+        try await answerAuthenticate(replacement, tag: "A001", mechanism: "PLAIN")
+        try await answerCapabilityRefresh(replacement, tag: "A002", capabilities: "IMAP4rev1 AUTH=PLAIN")
+        try await authTask.value
+        #expect(connection.isAuthenticated)
+        let staleWrite = try? await stale.channel.readOutbound(as: ByteBuffer.self)
+        #expect(staleWrite == nil, "nothing may be written on the transport the refresh replaced")
+    }
+
     // MARK: - Harness
 
     private func makeConnection(group: MultiThreadedEventLoopGroup, port: Int) -> IMAPConnection {
