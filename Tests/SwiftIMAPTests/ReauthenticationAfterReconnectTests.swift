@@ -28,7 +28,6 @@ struct ReauthenticationAfterReconnectTests {
     @Test
     func commandThatReopensTheTransportReauthenticatesFirst() async throws {
         let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
-        defer { try? group.syncShutdownGracefully() }
         let connection = makeConnection(group: group)
         let counter = ReauthenticationCounter()
         let replacement = try await loseAuthenticatedSession(on: connection, counter: counter)
@@ -41,12 +40,12 @@ struct ReauthenticationAfterReconnectTests {
         _ = try await noop.value
         #expect(connection.isAuthenticated)
         #expect(!connection.lostAuthenticatedSession)
+        await shutDownGracefully(group)
     }
 
     @Test
     func idleStartThatReopensTheTransportReauthenticatesFirst() async throws {
         let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
-        defer { try? group.syncShutdownGracefully() }
         let connection = makeConnection(group: group)
         let counter = ReauthenticationCounter()
         let replacement = try await loseAuthenticatedSession(on: connection, counter: counter)
@@ -59,12 +58,12 @@ struct ReauthenticationAfterReconnectTests {
         #expect(connection.isAuthenticated)
         _ = stream
         try? await connection.disconnect()
+        await shutDownGracefully(group)
     }
 
     @Test
     func reauthenticationWaitsWhileAuthenticationIsInProgress() async throws {
         let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
-        defer { try? group.syncShutdownGracefully() }
         let connection = makeConnection(group: group)
         let counter = ReauthenticationCounter()
         connection.lostAuthenticatedSession = true
@@ -77,12 +76,12 @@ struct ReauthenticationAfterReconnectTests {
         connection.authenticationInProgress = false
         try await connection.reauthenticateIfSessionWasLost(before: "NOOP")
         #expect(await counter.value() == 1)
+        await shutDownGracefully(group)
     }
 
     @Test
     func explicitDisconnectIsNotALostSession() async throws {
         let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
-        defer { try? group.syncShutdownGracefully() }
         let connection = makeConnection(group: group)
         let channel = try await makeTestingChannel(for: connection)
         connection.markSessionAuthenticated()
@@ -96,6 +95,7 @@ struct ReauthenticationAfterReconnectTests {
         connection.clearInvalidChannel()
         #expect(connection.lostAuthenticatedSession, "a dead channel under an authenticated session is a loss")
         _ = channel
+        await shutDownGracefully(group)
     }
 
     @Test
