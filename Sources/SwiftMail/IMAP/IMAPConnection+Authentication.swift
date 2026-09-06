@@ -4,32 +4,15 @@ import NIOIMAPCore
 import NIO
 
 extension IMAPConnection {
-    func login(username: String, password: String) async throws {
-        let command = LoginCommand(username: username, password: password)
-        let loginCapabilities = try await executeCommand(command)
-        isSessionAuthenticated = true
-        try await refreshCapabilities(using: loginCapabilities)
-        await fetchNamespacesIfSupported(useCommandBody: false)
-    }
-
     /// Authenticate using AUTHENTICATE PLAIN (RFC 4616) with optional SASL-IR (RFC 4959).
     ///
     /// When the server advertises `SASL-IR`, the credentials are sent inline with the
     /// AUTHENTICATE command (saving a round trip). Otherwise falls back to the standard
-    /// continuation-based exchange.
-    func authenticatePlain(username: String, password: String) async throws {
-        try await commandQueue.run { [self] in
-            try await self.authenticatePlainBody(username: username, password: password)
-        }
-    }
-
-    func authenticateXOAUTH2(email: String, accessToken: String) async throws {
-        try await commandQueue.run { [self] in
-            try await self.authenticateXOAUTH2Body(email: email, accessToken: accessToken)
-        }
-    }
-
+    /// continuation-based exchange. Runs inside the command queue; the queue-taking
+    /// entry points live in `IMAPConnection+Reauthentication.swift`.
     func authenticatePlainBody(username: String, password: String) async throws {
+        authenticationInProgress = true
+        defer { authenticationInProgress = false }
         let mechanism = AuthenticationMechanism("PLAIN")
         let channel = try await prepareAuthenticationChannel(
             operation: "PLAIN authenticate", advertising: .authenticate(mechanism), name: "PLAIN"
@@ -92,7 +75,7 @@ extension IMAPConnection {
 
             scheduledTask?.cancel()
             responseBuffer.hasActiveHandler = false
-            isSessionAuthenticated = true
+            markSessionAuthenticated()
 
             duplexLogger.flushInboundBuffer()
             try await refreshCapabilities(using: postAuthCapabilities)
@@ -238,6 +221,8 @@ extension IMAPConnection {
     }
 
     func authenticateXOAUTH2Body(email: String, accessToken: String) async throws {
+        authenticationInProgress = true
+        defer { authenticationInProgress = false }
         let mechanism = AuthenticationMechanism("XOAUTH2")
         let channel = try await prepareAuthenticationChannel(
             operation: "XOAUTH2 authenticate", advertising: .authenticate(mechanism), name: "XOAUTH2"
@@ -304,7 +289,7 @@ extension IMAPConnection {
             await handleConnectionTerminationInResponses(handler.untaggedResponses)
             duplexLogger.flushInboundBuffer()
 
-            isSessionAuthenticated = true
+            markSessionAuthenticated()
             // AUTHENTICATE often returns an OK without CAPABILITY data, and RFC 3501
             // invalidates the pre-authentication capability set once authentication
             // succeeds. Refresh from the server instead of retaining the stale
