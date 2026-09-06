@@ -213,8 +213,12 @@ final class IMAPConnection {
         namespaces
     }
 
+    /// An authenticated session needs a live channel. A transport the peer reset leaves
+    /// `isSessionAuthenticated` set until the next command notices the dead channel, and a
+    /// caller that trusted the flag alone then sent an authenticated-state command on the
+    /// fresh transport `executeCommandBody` reopens (Gmail answers `BAD Unknown command`).
     var isAuthenticated: Bool {
-        isSessionAuthenticated
+        isSessionAuthenticated && isConnected
     }
 
     var identifier: String {
