@@ -35,6 +35,7 @@ final class IMAPConnection {
     let commandQueue = IMAPCommandQueue()
     let responseBuffer = UntaggedResponseBuffer()
     var startTLSUpgradeOverrideForTesting: (() async throws -> Void)?
+    var capabilityRefreshOverrideForTesting: (() async throws -> Void)?
 
     let logger: Logging.Logger
     let duplexLogger: IMAPLogger
@@ -239,6 +240,10 @@ final class IMAPConnection {
 
     func replaceStartTLSUpgradeForTesting(_ upgrade: (() async throws -> Void)?) {
         self.startTLSUpgradeOverrideForTesting = upgrade
+    }
+
+    func replaceCapabilityRefreshForTesting(_ refresh: (() async throws -> Void)?) {
+        self.capabilityRefreshOverrideForTesting = refresh
     }
 
     func connect() async throws {
