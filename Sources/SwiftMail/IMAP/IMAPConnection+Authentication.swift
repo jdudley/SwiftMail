@@ -31,13 +31,9 @@ extension IMAPConnection {
 
     func authenticatePlainBody(username: String, password: String) async throws {
         let mechanism = AuthenticationMechanism("PLAIN")
-        let plainCapability = Capability.authenticate(mechanism)
-
-        guard capabilities.contains(plainCapability) else {
-            throw IMAPError.unsupportedAuthMechanism("PLAIN not advertised by server")
-        }
-
-        let channel = try await prepareAuthenticationChannel(operation: "PLAIN authenticate")
+        let channel = try await prepareAuthenticationChannel(
+            operation: "PLAIN authenticate", advertising: .authenticate(mechanism), name: "PLAIN"
+        )
         let tag = generateCommandTag()
 
         let handlerPromise = channel.eventLoop.makePromise(of: [Capability].self)
@@ -146,6 +142,40 @@ extension IMAPConnection {
         try await channel.writeAndFlush(wrapped)
     }
 
+    /// Returns the channel to authenticate on, judged against a capability snapshot
+    /// taken on that same channel. The check runs after the channel is prepared: a
+    /// disconnect clears the snapshot with the channel, and judging the stale empty
+    /// set first turned every re-authentication on a dropped connection into "not
+    /// advertised by server" without contacting the server. An empty snapshot on a
+    /// live channel is refreshed with an explicit CAPABILITY; that refresh runs through
+    /// `executeCommandBody`, which may recycle or reconnect the transport, so the
+    /// channel is prepared again afterwards and the caller authenticates on the
+    /// transport that is live now, never on one the refresh replaced.
+    private func prepareAuthenticationChannel(
+        operation: String,
+        advertising capability: Capability,
+        name: String
+    ) async throws -> Channel {
+        var channel = try await prepareAuthenticationChannel(operation: operation)
+        var refreshes = 0
+        while capabilities.isEmpty {
+            guard refreshes < 2 else {
+                throw IMAPError.connectionFailed("\(operation): capability snapshot stayed empty across reconnects")
+            }
+            refreshes += 1
+            if let override = capabilityRefreshOverrideForTesting {
+                try await override()
+            } else {
+                try await refreshCapabilities(using: [], useCommandBody: true)
+            }
+            channel = try await prepareAuthenticationChannel(operation: operation)
+        }
+        guard capabilities.contains(capability) else {
+            throw IMAPError.unsupportedAuthMechanism("\(name) not advertised by server")
+        }
+        return channel
+    }
+
     private func prepareAuthenticationChannel(operation: String) async throws -> Channel {
         try await waitForIdleCompletionIfNeeded()
         try await recycleConnectionIfBufferedTerminationIfNeeded(operation: operation)
@@ -209,13 +239,9 @@ extension IMAPConnection {
 
     func authenticateXOAUTH2Body(email: String, accessToken: String) async throws {
         let mechanism = AuthenticationMechanism("XOAUTH2")
-        let xoauthCapability = Capability.authenticate(mechanism)
-
-        guard capabilities.contains(xoauthCapability) else {
-            throw IMAPError.unsupportedAuthMechanism("XOAUTH2 not advertised by server")
-        }
-
-        let channel = try await prepareAuthenticationChannel(operation: "XOAUTH2 authenticate")
+        let channel = try await prepareAuthenticationChannel(
+            operation: "XOAUTH2 authenticate", advertising: .authenticate(mechanism), name: "XOAUTH2"
+        )
         let tag = generateCommandTag()
 
         let handlerPromise = channel.eventLoop.makePromise(of: [Capability].self)
