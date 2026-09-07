@@ -103,9 +103,10 @@ public actor IMAPServer {
 
     /// Whether the primary connection advertised MOVE (RFC 6851).
     ///
-    /// This reports the advertised capability only. The default
-    /// ``move(messages:to:fallback:)`` policy retains the existing UIDPLUS-dependent fallback,
-    /// while ``MoveFallbackPolicy/disabled`` requires MOVE directly.
+    /// This reports the latest advertised capability snapshot. Callers with a no-delete policy
+    /// should pass ``MoveFallbackPolicy/disabled`` to ``move(messages:to:fallback:)`` instead of
+    /// relying on this value as a separate guard; the operation refreshes authentication state,
+    /// requires MOVE directly (without requiring UIDPLUS), and refuses before any fallback command.
     public var supportsMove: Bool {
         capabilities.containsMoveCapability
     }
