@@ -108,8 +108,37 @@ struct SearchBadCharsetTests {
         #expect(unlisted.failureReason == "The server does not support the charset the search used")
         #expect(
             listed.recoverySuggestion
-                == "Retry with a charset the server supports, or limit the search text to US-ASCII."
+                == "Retry with a charset the server supports: US-ASCII-only search text for SEARCH, "
+                + "or a supported sortCharset for SORT."
         )
+    }
+
+    @Test
+    func rejectionsWithoutTextKeepTheirWording() async throws {
+        let channel = try await NIOAsyncTestingChannel.withIMAPClientHandler()
+        let promise = channel.eventLoop.makePromise(of: MessageIdentifierSet<UID>.self)
+        try await channel.pipeline.addHandler(SearchHandler<UID>(commandTag: "B006", promise: promise))
+        try await Self.send(Self.plainSearch(tag: "B006"), on: channel)
+        try await Self.respond("B006 NO", on: channel)
+
+        guard case .commandFailed(let reason)? = await Self.failure(of: promise.futureResult) else {
+            Issue.record("Expected commandFailed")
+            return
+        }
+        #expect(reason == "Search failed: NO ")
+    }
+
+    @Test
+    func badCharsetWithoutTextCarriesTheCodeAlone() {
+        let responseText = NIOIMAPCore.ResponseText(code: .badCharset(["US-ASCII"]), text: "")
+        let error = IMAPError.searchRejected(operation: "Extended search", status: "NO", responseText: responseText)
+
+        guard case .searchCharsetNotSupported(let supportedCharsets, let reason) = error else {
+            Issue.record("Expected searchCharsetNotSupported")
+            return
+        }
+        #expect(supportedCharsets == ["US-ASCII"])
+        #expect(reason == "Extended search failed: NO [BADCHARSET (US-ASCII)] ")
     }
 
     // MARK: - Helpers

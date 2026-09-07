@@ -204,7 +204,8 @@ extension IMAPError: LocalizedError {
             case .malformedCopyUIDAfterTaggedOK:
                 return "Do not retry. The command completed; refresh the affected mailboxes before continuing."
             case .searchCharsetNotSupported:
-                return "Retry with a charset the server supports, or limit the search text to US-ASCII."
+                return "Retry with a charset the server supports: US-ASCII-only search text for SEARCH, "
+                    + "or a supported sortCharset for SORT."
             default:
                 return "Check the error details and try again."
         }
@@ -216,7 +217,14 @@ extension IMAPError {
     /// response carries that code, otherwise `commandFailed` with the response code kept in wire
     /// form, so `[NONEXISTENT]`, `[THROTTLED]` and the like stay readable in the message.
     static func searchRejected(operation: String, status: String, responseText: ResponseText) -> IMAPError {
-        let reason = "\(operation) failed: \(status) \(responseText.debugDescription)"
+        // Rendered by hand rather than through ResponseText's description: NIO accepts a NO or
+        // BAD with no text (iCloud, Oracle) and the description substitutes a placeholder space,
+        // which would turn the established "NO " wording of a code-less rejection into "NO  ".
+        var reason = "\(operation) failed: \(status)"
+        if let code = responseText.code {
+            reason += " [\(code.debugDescription)]"
+        }
+        reason += " \(responseText.text)"
         if case .badCharset(let supportedCharsets)? = responseText.code {
             return .searchCharsetNotSupported(supportedCharsets: supportedCharsets, reason: reason)
         }
