@@ -69,7 +69,12 @@ public actor IMAPServer {
     var pendingNamedConnectionWaiters: [String: [CheckedContinuation<IMAPNamedConnection, any Error>]] = [:]
 
     /// Authentication configuration for spawning new connections.
-    var authentication: Authentication?
+    var authentication: Authentication? {
+        didSet { installReauthenticationOnOwnedConnections() }
+    }
+    /// The primary re-authentication in flight, shared by every caller that finds the
+    /// session gone at the same time.
+    var primaryAuthenticationInFlight: Task<Void, Error>?
 
     /// RFC 2971 client identity replayed after every successful
     /// authentication on every connection this server opens (primary,
@@ -103,6 +108,10 @@ public actor IMAPServer {
     /// while ``MoveFallbackPolicy/disabled`` requires MOVE directly.
     public var supportsMove: Bool {
         capabilities.containsMoveCapability
+    }
+
+    func replaceAuthenticationForTesting(_ authentication: Authentication?) {
+        self.authentication = authentication
     }
 
     var certificatePolicyForTesting: MailCertificateVerificationPolicy {

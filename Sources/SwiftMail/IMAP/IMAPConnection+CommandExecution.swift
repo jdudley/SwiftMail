@@ -71,6 +71,7 @@ extension IMAPConnection {
         if self.channel == nil {
             logger.info("\(connectionContext) Channel is nil, re-establishing connection before sending command")
             try await connectBody()
+            try await reauthenticateIfSessionWasLost(before: String(describing: CommandType.self))
         }
 
         guard let channel = self.channel, channel.isActive else {
